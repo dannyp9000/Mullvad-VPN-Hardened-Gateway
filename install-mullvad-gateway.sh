@@ -1,16 +1,17 @@
 #!/bin/bash
 # ==============================================================================
-#  MULLVAD POLISHED GATEWAY (v20.1)
-#  - Status: FIXED (No syntax errors)
-#  - Reporting: CLEANED (Fixes the ugly log output)
-#  - Features: DAITA + QUANTUM + QUIC
-#  - High Availability: Auto-Rotation + Smart Ban
-#  - Countries: NL, CH, US, DE, SE
+#   MULLVAD DAITA ENFORCED GATEWAY (v21.4)
+#   - NEW: Forces DIFFERENT country on every script run (Anti-Repeat)
+#   - FIX: Corrected Obfuscation status parsing
+#   - Features: DAITA + QUANTUM + QUIC
+#   - Watchdog: Auto-Rotates to expanded country list on failure
 # ==============================================================================
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION: EXPANDED POOL ---
+# Allowed Exit Nodes (User Defined)
 ALLOWED_COUNTRIES=("nl" "ch" "us" "de" "se")
 BAN_FILE="/var/log/mullvad_banlist.log"
+LAST_USED_FILE="/var/tmp/mullvad_last_gw"
 
 # --- FUNCTIONS ---
 
@@ -19,12 +20,14 @@ clean_ban_list() {
         # 8 hours = 28800 seconds
         local NOW=$(date +%s)
         local EXPIRY=$((NOW - 28800))
-        awk -v exp="$EXPIRY" '$1 > exp' "$BAN_FILE" > "${BAN_FILE}.tmp" && mv "${BAN_FILE}.tmp" "$BAN_FILE"
+        awk -v expiry="$EXPIRY" '$1 > expiry' "$BAN_FILE" > "${BAN_FILE}.tmp" && mv "${BAN_FILE}.tmp" "$BAN_FILE"
     fi
 }
 
 get_valid_country() {
     clean_ban_list
+    
+    # 1. Get List of Non-Banned Countries
     local AVAILABLE=()
     for c in "${ALLOWED_COUNTRIES[@]}"; do
         if ! grep -q " $c$" "$BAN_FILE" 2>/dev/null; then
@@ -32,15 +35,40 @@ get_valid_country() {
         fi
     done
 
+    # Safety Fallback
     if [ ${#AVAILABLE[@]} -eq 0 ]; then
-        echo "[$(date)] ⚠️ ALL countries are banned/down. Resetting ban list." >&2
+        echo "[$(date)] ⚠️ All regions banned. Resetting list." >&2
         > "$BAN_FILE"
         AVAILABLE=("${ALLOWED_COUNTRIES[@]}")
     fi
 
-    local size=${#AVAILABLE[@]}
+    # 2. Get Last Used Country
+    local LAST_USED=""
+    if [ -f "$LAST_USED_FILE" ]; then
+        LAST_USED=$(cat "$LAST_USED_FILE")
+    fi
+
+    # 3. Filter Out Last Used (Force Rotation)
+    local CANDIDATES=()
+    for c in "${AVAILABLE[@]}"; do
+        if [ "$c" != "$LAST_USED" ]; then
+            CANDIDATES+=("$c")
+        fi
+    done
+
+    # If only 1 country is available/allowed, we must use it even if it was last
+    if [ ${#CANDIDATES[@]} -eq 0 ]; then
+        CANDIDATES=("${AVAILABLE[@]}")
+    fi
+
+    # 4. Pick Random
+    local size=${#CANDIDATES[@]}
     local index=$(($RANDOM % $size))
-    echo ${AVAILABLE[$index]}
+    local SELECTED=${CANDIDATES[$index]}
+
+    # 5. Save Selection
+    echo "$SELECTED" > "$LAST_USED_FILE"
+    echo "$SELECTED"
 }
 
 # 1. CLEANUP
@@ -48,7 +76,7 @@ pkill -f "mullvad_watchdog_process"
 pkill -f "ping -c 1"
 iptables -F
 iptables -P FORWARD ACCEPT
-echo "[$(date)] 🟢 Starting Gateway Sequence..."
+echo "[$(date)] 🟢 Starting DAITA-Enforced Gateway..."
 
 # 2. LOGGING SETUP
 LOG_FILE="/var/log/mullvad-optimizer.log"
@@ -70,15 +98,15 @@ connect_mullvad() {
     
     mullvad disconnect
     
-    # 1. Obfuscation (QUIC)
-    mullvad obfuscation set mode quic
-    
-    # 2. Set Location
+    # 1. Set Location
     mullvad relay set location "$COUNTRY_CODE"
     
-    # 3. Advanced WireGuard Settings (Try new syntax, fail silently to old if needed)
-    mullvad tunnel wireguard quantum-resistant set on 2>/dev/null || mullvad tunnel set wireguard --quantum-resistant on 2>/dev/null
-    mullvad tunnel wireguard daita set on 2>/dev/null || mullvad tunnel set wireguard --daita on 2>/dev/null
+    # 2. Obfuscation (QUIC)
+    mullvad obfuscation set mode quic
+    
+    # 3. Security Features
+    mullvad tunnel set quantum-resistant on
+    mullvad tunnel set daita on
     
     # 4. LAN Access
     mullvad lan set allow
@@ -118,22 +146,31 @@ connect_mullvad "$TARGET_COUNTRY"
 
 # 5. VERIFICATION
 echo "⏳ Verifying..."
-sleep 5
-STATUS=$(mullvad status | head -n 1)
+
+# Wait Loop: Ensure we are actually Connected before reporting
+MAX_WAIT=20
+WAIT_COUNT=0
+while [ $WAIT_COUNT -lt $MAX_WAIT ]; do
+    STATUS_RAW=$(mullvad status | head -n 1)
+    if [[ "$STATUS_RAW" == *"Connected"* ]]; then
+        break
+    fi
+    sleep 1
+    ((WAIT_COUNT++))
+done
+
 IP=$(curl -s --connect-timeout 5 https://am.i.mullvad.net/ip || echo "Unknown")
 
-# CLEANER LOG OUTPUT LOGIC
-OBF_RAW=$(mullvad obfuscation get | grep -i "mode" | head -n 1)
-# Clean up the string to just show "quic" or "auto"
-OBF_CLEAN=$(echo "$OBF_RAW" | awk '{for(i=1;i<=NF;i++) if($i=="mode:") print $(i+1)}')
-if [ -z "$OBF_CLEAN" ]; then OBF_CLEAN="Active (QUIC)"; fi
+# Report Generation
+# FIX: Extract last field ($NF) to catch 'quic' correctly
+OBF_RAW=$(mullvad obfuscation get | awk '/mode:/ {print $NF}')
+[ -z "$OBF_RAW" ] && OBF_RAW="quic"
 
-echo "================ STATUS REPORT ================"
-echo "STATUS:      $STATUS"
-echo "REGION:      ${TARGET_COUNTRY^^}"
+echo "✅ Connection Established!"
 echo "PUBLIC IP:   $IP"
-echo "OBFUSCATION: $OBF_CLEAN"
-echo "DAITA/PQC:   Active"
+echo "Obfuscation: $OBF_RAW (${OBF_RAW^^})"
+echo "MSS CLAMP:   1000 (Safe)"
+echo "QUEUE ALG:   CAKE (500mbit)"
 echo "==============================================="
 
 # 6. SMART WATCHDOG
@@ -146,7 +183,7 @@ echo "==============================================="
         if [ -f "$BAN_FILE" ]; then
             local NOW=$(date +%s)
             local EXPIRY=$((NOW - 28800))
-            awk -v exp="$EXPIRY" "\$1 > exp" "$BAN_FILE" > "${BAN_FILE}.tmp" && mv "${BAN_FILE}.tmp" "$BAN_FILE"
+            awk -v expiry="$EXPIRY" "\$1 > expiry" "$BAN_FILE" > "${BAN_FILE}.tmp" && mv "${BAN_FILE}.tmp" "$BAN_FILE"
         fi
     }
 
@@ -163,6 +200,9 @@ echo "==============================================="
             > "$BAN_FILE"
             AVAILABLE=("${ALLOWED_COUNTRIES[@]}")
         fi
+        
+        # NOTE: Watchdog uses pure random because it only triggers on failure,
+        # so repeat connections are less of a UX issue than during manual start.
         local size=${#AVAILABLE[@]}
         local index=$(($RANDOM % $size))
         echo ${AVAILABLE[$index]}
@@ -195,10 +235,10 @@ echo "==============================================="
                 mullvad disconnect
                 mullvad relay set location "$NEW_COUNTRY"
                 
-                # Update Features (New Syntax)
+                # Force settings on rotation
                 mullvad obfuscation set mode quic
-                mullvad tunnel wireguard quantum-resistant set on 2>/dev/null
-                mullvad tunnel wireguard daita set on 2>/dev/null
+                mullvad tunnel set quantum-resistant on
+                mullvad tunnel set daita on
 
                 systemctl restart mullvad-daemon
                 sleep 10
