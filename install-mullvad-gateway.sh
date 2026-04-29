@@ -1,39 +1,48 @@
 #!/bin/bash
 # ==============================================================================
-#   MULLVAD HARDENED GATEWAY — DAITA + Quantum + QUIC (v25.0)
+#   MULLVAD HARDENED GATEWAY — DAITA + Quantum + QUIC (v26.0)
 #   Tested: Mullvad 2026.1 / Debian 13 (Trixie) / Pi 5 4GB / Proxmox VM
 #
 #   Usage:
 #     sudo bash install-mullvad-gateway.sh
-#     sudo LAN_IF=ens19 bash install-mullvad-gateway.sh
+#     sudo LAN_IF=eth0 bash install-mullvad-gateway.sh
 #     sudo LAN_IF=eth0 WG_MTU=1280 MSS_CLAMP=1000 bash install-mullvad-gateway.sh
+#     sudo ENABLE_LOCKDOWN=0 bash install-mullvad-gateway.sh   # no host kill-switch
 #
-#   v25 changes (output polish on top of v24 fixes):
-#     - Emoji-prefixed status messages matching README style
-#     - Verbose status report with relay name, location, tunnel IPs
-#     - Account expiry shown in pre-flight
-#     - MSS / MTU annotated with safety descriptor
-#     - Obfuscation shown as "name (DESCRIPTION)" form
-#     - Watchdog log entries get connection-drop / recovery emoji
-#     - Cleaner section dividers
+#   Emergency recovery: see teardown-mullvad-gateway.sh (separate file)
 #
-#   v24 fixes:
-#     - Strict 16-digit Mullvad account regex (no false-positive on 4-digit nums)
+#   v26 — CRITICAL bugfix release:
+#     - REMOVED `trap restore_ssh ERR` — was firing on parsing pipeline failures
+#       and wiping the firewall mid-script, breaking all internet
+#     - REMOVED `set -o pipefail` — caused grep-no-match to cascade into ERR
+#     - All parsing pipelines now use `awk` patterns (never fail on no-match)
+#     - Text status parsing rewritten to match ACTUAL multi-line Mullvad format
+#       (Relay: foo via bar / Visible location: x / IPv4: y on separate lines)
+#     - JSON status preferred for relay info
+#     - Critical commands now explicitly checked with `if ! cmd; then fail; fi`
+#     - All [ -n "$X" ] && Y=z patterns replaced with explicit if blocks
+#       (those can also trigger ERR when $X is empty)
+#
+#   Inherited from v24/v25 (still in place):
+#     - Strict 16-digit account regex
 #     - LAN_IF detection refuses to guess on multi-iface systems
-#     - set -uo pipefail + explicit fail() / restore_ssh on signals
 #     - restore_ssh() flushes filter, nat, mangle, ip6tables
-#     - mullvad lockdown-mode as host kill-switch
-#     - mullvad status --json parsing (text fallback case-ordered correctly)
-#     - mullvad connect --wait replaces manual poll loops
-#     - Watchdog: DAITA-off fallback + exponential backoff
-#     - WG_MTU / MSS_CLAMP env-overridable with stacked-WG defaults
-#     - MSS clamp on FORWARD AND OUTPUT
-#     - Keyring download error-checked, apt errors surfaced
+#     - mullvad lockdown-mode as host kill-switch (after verified connect)
+#     - mullvad connect --wait
+#     - Watchdog: DAITA-off fallback + exponential backoff, stable tag/pidfile
+#     - WG_MTU / MSS_CLAMP env-overridable, conservative defaults
+#     - MSS clamp on FORWARD AND OUTPUT chains
 #     - ethtool guarded for virtio NICs
-#     - Watchdog uses stable tag + pidfile (no version-pinned pkill)
+#     - Emoji-rich status output
 # ==============================================================================
 
-set -uo pipefail
+# IMPORTANT:
+#   `set -e` is NOT used. The script handles errors explicitly via fail().
+#   `set -o pipefail` is NOT used. With pipefail + ERR trap, a single
+#       `grep | head | awk` pipeline that legitimately finds nothing was
+#       cascading into a firewall reset. That bug broke v25.
+#   `set -u` is used (catches typos in variable names — harmless).
+set -u
 
 # --- CONFIG ---
 ALLOWED_COUNTRIES=("nl" "ch" "us" "de" "se")
@@ -42,13 +51,12 @@ LAST_USED_FILE="/var/tmp/mullvad_last_gw"
 LOG_FILE="/var/log/mullvad-optimizer.log"
 WATCHDOG_PIDFILE="/var/run/mullvad-gateway-watchdog.pid"
 WATCHDOG_TAG="mullvad_gateway_watchdog"
-SCRIPT_VERSION="25.0"
+SCRIPT_VERSION="26.0"
 
-# Tunables (env-overridable). Defaults sized for stacked WG-in-WG (Proton -> Mullvad)
-# where outer overhead eats roughly 80 + 40 = 120 bytes off a 1500 path MTU.
+# Tunables (env-overridable). Defaults for stacked WG-in-WG.
 CAKE_BW="${CAKE_BW:-500mbit}"
-WG_MTU="${WG_MTU:-1280}"          # WireGuard floor per Mullvad docs.
-MSS_CLAMP="${MSS_CLAMP:-1100}"    # Conservative for stacked tunnels.
+WG_MTU="${WG_MTU:-1280}"
+MSS_CLAMP="${MSS_CLAMP:-1100}"
 ENABLE_LOCKDOWN="${ENABLE_LOCKDOWN:-1}"
 
 # --- DESCRIPTOR HELPERS ---
@@ -114,7 +122,7 @@ echo "  🔒 MULLVAD HARDENED GATEWAY  v${SCRIPT_VERSION}"
 echo "      DAITA + Quantum-Resistant + QUIC"
 echo "══════════════════════════════════════════════════════════════"
 
-[ "$(id -u)" -ne 0 ] && { echo "❌ FAIL: Must run as root"; exit 1; }
+if [ "$(id -u)" -ne 0 ]; then echo "❌ FAIL: Must run as root"; exit 1; fi
 
 # --- INSTALL DEPENDENCIES ---
 NEEDED_PKGS=()
@@ -127,8 +135,8 @@ for pkg in curl iptables conntrack ethtool iproute2; do
 done
 if [ "${#NEEDED_PKGS[@]}" -gt 0 ]; then
     echo "📦 Installing: ${NEEDED_PKGS[*]}"
-    apt-get update -qq          || { echo "❌ FAIL: apt-get update"; exit 1; }
-    apt-get install -y "${NEEDED_PKGS[@]}" || { echo "❌ FAIL: package install"; exit 1; }
+    if ! apt-get update -qq; then echo "❌ FAIL: apt-get update"; exit 1; fi
+    if ! apt-get install -y "${NEEDED_PKGS[@]}"; then echo "❌ FAIL: package install"; exit 1; fi
 fi
 
 if ! command -v mullvad &>/dev/null; then
@@ -141,14 +149,14 @@ if ! command -v mullvad &>/dev/null; then
     ARCH="$(dpkg --print-architecture)"
     echo "deb [signed-by=/usr/share/keyrings/mullvad-keyring.asc arch=${ARCH}] https://repository.mullvad.net/deb/stable stable main" \
         > /etc/apt/sources.list.d/mullvad.list
-    apt-get update -qq      || { echo "❌ FAIL: apt-get update after Mullvad repo"; exit 1; }
-    apt-get install -y mullvad-vpn || { echo "❌ FAIL: Mullvad install"; exit 1; }
+    if ! apt-get update -qq; then echo "❌ FAIL: apt-get update after Mullvad repo"; exit 1; fi
+    if ! apt-get install -y mullvad-vpn; then echo "❌ FAIL: Mullvad install"; exit 1; fi
     echo "✅ Mullvad installed"
     sleep 3
 fi
 
 # --- INTERFACE ---
-detect_lan_if || exit 1
+if ! detect_lan_if; then exit 1; fi
 if ! ip link show "$LAN_IF" &>/dev/null; then
     echo "❌ FAIL: Interface '$LAN_IF' not found"
     ip -br link show | grep -v lo
@@ -157,7 +165,9 @@ fi
 echo "✅ Interface: $LAN_IF"
 
 TOTAL_RAM_MB=$(awk '/MemTotal/ {printf "%d", $2/1024}' /proc/meminfo)
-[ "$TOTAL_RAM_MB" -lt 1500 ] && echo "⚠️  WARN: ${TOTAL_RAM_MB}MB RAM — DAITA may OOM"
+if [ "$TOTAL_RAM_MB" -lt 1500 ]; then
+    echo "⚠️  WARN: ${TOTAL_RAM_MB}MB RAM — DAITA may OOM"
+fi
 
 # --- DAEMON READY ---
 systemctl start mullvad-daemon 2>/dev/null || true
@@ -165,10 +175,7 @@ systemctl start mullvad-daemon 2>/dev/null || true
 echo -n "⏳ Waiting for daemon"
 TRIES=0
 while [ $TRIES -lt 30 ]; do
-    if mullvad status &>/dev/null; then
-        echo " ok"
-        break
-    fi
+    if mullvad status &>/dev/null; then echo " ok"; break; fi
     echo -n "."
     sleep 1
     TRIES=$((TRIES + 1))
@@ -183,12 +190,9 @@ fi
 mullvad disconnect 2>/dev/null || true
 sleep 2
 
-# --- LOGIN CHECK (strict 16-digit account format) ---
+# --- LOGIN CHECK ---
 LOGGED_IN=false
-
-if [ -f /etc/mullvad-vpn/device.json ]; then
-    LOGGED_IN=true
-fi
+if [ -f /etc/mullvad-vpn/device.json ]; then LOGGED_IN=true; fi
 
 if ! $LOGGED_IN; then
     ACCT_OUT="$(mullvad account get 2>&1 || true)"
@@ -216,15 +220,9 @@ if ! $LOGGED_IN; then
     exit 1
 fi
 
-# Show account expiry if available (cosmetic, doesn't fail script if missing)
-ACCT_EXPIRY=""
-ACCT_VERBOSE="$(mullvad account get 2>/dev/null || true)"
-if [ -n "$ACCT_VERBOSE" ]; then
-    ACCT_EXPIRY="$(echo "$ACCT_VERBOSE" \
-        | grep -iE 'expir' \
-        | head -1 \
-        | sed -E 's/^[^:]+:[[:space:]]*//')"
-fi
+# Account expiry — defensive (awk doesn't fail on no-match, unlike grep)
+ACCT_VERBOSE="$(mullvad account get 2>/dev/null || echo)"
+ACCT_EXPIRY="$(echo "$ACCT_VERBOSE" | awk -F': *' 'tolower($1) ~ /expir/ {sub(/^[^:]+: */,""); print; exit}')"
 if [ -n "$ACCT_EXPIRY" ]; then
     echo "✅ Mullvad account (expires: $ACCT_EXPIRY)"
 else
@@ -232,13 +230,15 @@ else
 fi
 
 # --- LOGGING ---
-touch "$LOG_FILE" || { echo "❌ FAIL: Cannot write $LOG_FILE"; exit 1; }
+if ! touch "$LOG_FILE"; then echo "❌ FAIL: Cannot write $LOG_FILE"; exit 1; fi
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo ""
 echo "[$(date)] 🚀 Starting Hardened Gateway v${SCRIPT_VERSION}"
 echo "[$(date)] ⚙️  Config: LAN_IF=$LAN_IF WG_MTU=$WG_MTU MSS_CLAMP=$MSS_CLAMP CAKE_BW=$CAKE_BW LOCKDOWN=$ENABLE_LOCKDOWN"
 
-# --- SSH SAFETY ---
+# --- SAFETY HELPERS ---
+# restore_ssh is ONLY called via fail() (explicit critical errors) or
+# signal traps (INT/TERM during setup). It is NEVER auto-triggered by ERR.
 restore_ssh() {
     echo "[$(date)] 🚨 restore_ssh() — emergency firewall reset"
     iptables  -P INPUT   ACCEPT 2>/dev/null || true
@@ -261,7 +261,8 @@ fail() {
     exit 1
 }
 
-trap restore_ssh ERR
+# Signal traps ONLY — no ERR trap. v25 had `trap restore_ssh ERR` which fired
+# on parsing pipeline failures and wiped the firewall during normal execution.
 trap 'echo "[$(date)] 🛑 Caught signal — cleaning up"; restore_ssh; exit 130' INT TERM
 
 # --- HELPERS ---
@@ -277,19 +278,19 @@ get_valid_country() {
     clean_ban_list
     local AVAILABLE=()
     for c in "${ALLOWED_COUNTRIES[@]}"; do
-        grep -q " $c$" "$BAN_FILE" 2>/dev/null || AVAILABLE+=("$c")
+        if ! grep -q " $c$" "$BAN_FILE" 2>/dev/null; then AVAILABLE+=("$c"); fi
     done
     if [ "${#AVAILABLE[@]}" -eq 0 ]; then
         : > "$BAN_FILE"
         AVAILABLE=("${ALLOWED_COUNTRIES[@]}")
     fi
     local LAST=""
-    [ -f "$LAST_USED_FILE" ] && LAST="$(cat "$LAST_USED_FILE")"
+    if [ -f "$LAST_USED_FILE" ]; then LAST="$(cat "$LAST_USED_FILE")"; fi
     local CANDS=()
     for c in "${AVAILABLE[@]}"; do
-        [ "$c" != "$LAST" ] && CANDS+=("$c")
+        if [ "$c" != "$LAST" ]; then CANDS+=("$c"); fi
     done
-    [ "${#CANDS[@]}" -eq 0 ] && CANDS=("${AVAILABLE[@]}")
+    if [ "${#CANDS[@]}" -eq 0 ]; then CANDS=("${AVAILABLE[@]}"); fi
     local SEL="${CANDS[$((RANDOM % ${#CANDS[@]}))]}"
     echo "$SEL" > "$LAST_USED_FILE"
     echo "$SEL"
@@ -326,40 +327,57 @@ get_status_state() {
             | head -1 \
             | sed -E 's/.*"state"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' \
             | tr '[:upper:]' '[:lower:]'
-    else
-        local FIRST
-        FIRST="$(mullvad status 2>/dev/null | head -1 | tr '[:upper:]' '[:lower:]')"
-        # Order matters — disconnected/connecting both contain "connected" as substring
-        case "$FIRST" in
-            *disconnected*)    echo "disconnected" ;;
-            *connecting*)      echo "connecting"   ;;
-            *connected*)       echo "connected"    ;;
-            *blocked*|*error*) echo "error"        ;;
-            *)                 echo "unknown"      ;;
-        esac
+        return 0
     fi
-}
-
-# Parse `mullvad status -v` for relay name and location string.
-# Format (from Mullvad docs): "Connected to se-got-wg-004 in Gothenburg, Sweden"
-# Multihop:                    "Connected to se-got-wg-004 via dk-cph-wg-001 in Gothenburg, Sweden"
-get_relay_info() {
-    local STATUS_V="$1"
     local FIRST
-    FIRST="$(echo "$STATUS_V" | head -1)"
-
-    local RELAY="" ENTRY="" LOCATION=""
-    # Extract "to <relay>" — the exit relay
-    RELAY="$(echo "$FIRST" | sed -nE 's/.*[Cc]onnected to[[:space:]]+([a-z0-9-]+).*/\1/p')"
-    # Extract "via <entry>" — multihop entry, if present
-    ENTRY="$(echo "$FIRST" | sed -nE 's/.*via[[:space:]]+([a-z0-9-]+).*/\1/p')"
-    # Extract "in <location>"
-    LOCATION="$(echo "$FIRST" | sed -nE 's/.*in[[:space:]]+(.*[A-Za-z]).*/\1/p' | sed 's/\.$//')"
-
-    echo "$RELAY|$ENTRY|$LOCATION"
+    FIRST="$(mullvad status 2>/dev/null | head -1 | tr '[:upper:]' '[:lower:]')"
+    # Order matters — disconnected/connecting both contain "connected" as substring
+    case "$FIRST" in
+        *disconnected*)    echo "disconnected" ;;
+        *connecting*)      echo "connecting"   ;;
+        *connected*)       echo "connected"    ;;
+        *blocked*|*error*) echo "error"        ;;
+        *)                 echo "unknown"      ;;
+    esac
 }
 
-# --- HOST KILL-SWITCH (off during connect; on after verified) ---
+# Parse the full text status output for relay info.
+# Real Mullvad 2026.1 format (multi-line):
+#   Connected
+#   Relay: se-got-wg-001 via dk-cph-wg-001
+#   Features: Multihop, DAITA, Quantum Resistance, QUIC
+#   Visible location: Sweden, Gothenburg.
+#   IPv4: 193.32.249.66
+# All parsing uses awk (zero-fail on no-match) and emits empty string if absent.
+parse_status_field() {
+    local STATUS_TEXT="$1" KEY="$2"
+    # Find line matching "$KEY:" anywhere in the field (case-insensitive)
+    echo "$STATUS_TEXT" | awk -v k="$KEY" '
+        BEGIN { IGNORECASE=1 }
+        $0 ~ "^[[:space:]]*"k":" {
+            sub(/^[^:]*:[[:space:]]*/, "")
+            sub(/[[:space:]]*\.?$/, "")
+            print
+            exit
+        }
+    '
+}
+
+# Extract relay (and optional via-entry) from the "Relay:" line.
+# Returns:  RELAY|ENTRY|""   (location filled separately)
+parse_relay_line() {
+    local STATUS_TEXT="$1"
+    local LINE
+    LINE="$(parse_status_field "$STATUS_TEXT" "Relay")"
+    if [ -z "$LINE" ]; then echo "||"; return 0; fi
+    # LINE is like "se-got-wg-001 via dk-cph-wg-001" or just "se-got-wg-001"
+    local RELAY ENTRY
+    RELAY="$(echo "$LINE" | awk '{print $1}')"
+    ENTRY="$(echo "$LINE" | awk '/via/ {for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')"
+    echo "${RELAY}|${ENTRY}|"
+}
+
+# --- HOST KILL-SWITCH (off during setup) ---
 mullvad lockdown-mode set off 2>/dev/null || true
 
 # --- KILL PRIOR WATCHDOG ---
@@ -374,12 +392,13 @@ fi
 pkill -f "$WATCHDOG_TAG" 2>/dev/null || true
 
 # --- FIREWALL LOCKDOWN ---
-iptables -P FORWARD DROP || fail "iptables policy FORWARD DROP failed"
-iptables -P INPUT   DROP || fail "iptables policy INPUT DROP failed"
+# Use explicit checks here. If any of these fail, we MUST bail with restore_ssh.
+if ! iptables -P FORWARD DROP; then fail "iptables policy FORWARD DROP"; fi
+if ! iptables -P INPUT   DROP; then fail "iptables policy INPUT DROP"; fi
 iptables -P OUTPUT  ACCEPT
-iptables -F             || fail "iptables flush failed"
-iptables -t nat    -F   || fail "nat flush failed"
-iptables -t mangle -F   || fail "mangle flush failed"
+if ! iptables -F;             then fail "iptables flush"; fi
+if ! iptables -t nat    -F;   then fail "nat flush"; fi
+if ! iptables -t mangle -F;   then fail "mangle flush"; fi
 
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A INPUT  -m state --state ESTABLISHED,RELATED -j ACCEPT
@@ -399,7 +418,7 @@ if [ -n "$DRIVER" ] && [ "$DRIVER" != "virtio_net" ]; then
     ethtool --set-eee "$LAN_IF" eee off 2>/dev/null || true
 fi
 
-sysctl -w net.ipv4.ip_forward=1 > /dev/null || fail "ip_forward sysctl failed"
+if ! sysctl -w net.ipv4.ip_forward=1 > /dev/null; then fail "ip_forward sysctl"; fi
 sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null || true
 sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
 if [ -n "$LAN_IF" ]; then
@@ -421,7 +440,10 @@ connect_mullvad() {
         sleep 5
     fi
 
-    mullvad relay set location "$CC" || { echo "  ⚠️  WARN: relay set failed"; return 1; }
+    if ! mullvad relay set location "$CC"; then
+        echo "  ⚠️  WARN: relay set failed for $CC"
+        return 1
+    fi
     set_features
 
     local CONNECT_OUT
@@ -433,7 +455,6 @@ connect_mullvad() {
         echo "══════════════════════════════════════════════════════════════"
         echo "  ❌ NOT LOGGED IN — daemon lost session"
         echo "  Run: mullvad account login YOUR_ACCOUNT_NUMBER"
-        echo "  Then re-run this script."
         echo "══════════════════════════════════════════════════════════════"
         restore_ssh
         exit 1
@@ -449,8 +470,8 @@ connect_mullvad() {
     local WG_IF=""
     local WAIT=0
     while [ $WAIT -lt 15 ]; do
-        WG_IF="$(ip -br link show 2>/dev/null | grep -oE 'wg[0-9]?-mullvad' | head -1)"
-        [ -n "$WG_IF" ] && break
+        WG_IF="$(ip -br link show 2>/dev/null | awk '/wg[0-9]?-mullvad/ {print $1; exit}')"
+        if [ -n "$WG_IF" ]; then break; fi
         sleep 1
         WAIT=$((WAIT + 1))
     done
@@ -461,7 +482,7 @@ connect_mullvad() {
     echo "[$(date)] ✅ Interface created: $WG_IF"
     echo "$WG_IF" > /var/tmp/mullvad_current_if
 
-    ip link set dev "$WG_IF" mtu "$WG_MTU" || echo "  ⚠️  WARN: MTU set failed"
+    ip link set dev "$WG_IF" mtu "$WG_MTU" 2>/dev/null || echo "  ⚠️  WARN: MTU set failed"
     iptables -A FORWARD -i "$LAN_IF" -o "$WG_IF" -j ACCEPT
     iptables -t nat -A POSTROUTING -o "$WG_IF" -j MASQUERADE
 
@@ -507,32 +528,42 @@ echo "[$(date)] 🔍 Verifying connection..."
 WG_IF="$(cat /var/tmp/mullvad_current_if 2>/dev/null || echo '?')"
 STATE="$(get_status_state)"
 
-IP="$(curl -s --max-time 8 https://am.i.mullvad.net/ip 2>/dev/null || echo 'Unknown')"
-FULL_STATUS="$(mullvad status -v 2>/dev/null || mullvad status 2>/dev/null || echo)"
+# Best-effort. NEVER allowed to fail the script. Each pipeline returns "" on miss.
+IP="$(curl -s --max-time 8 https://am.i.mullvad.net/ip 2>/dev/null || echo)"
+if [ -z "$IP" ]; then IP="Unknown"; fi
 
-# Parse relay info from verbose status
-RELAY_INFO="$(get_relay_info "$FULL_STATUS")"
-RELAY_NAME="${RELAY_INFO%%|*}"
-ENTRY_NAME="$(echo "$RELAY_INFO" | cut -d'|' -f2)"
-LOCATION="$(echo "$RELAY_INFO" | cut -d'|' -f3)"
+# Try `mullvad status -v` first; fall back to plain `mullvad status`. Either is fine.
+FULL_STATUS="$( { mullvad status -v 2>/dev/null || mullvad status 2>/dev/null; } || echo)"
 
-# Tunnel IPv4 (best effort)
-TUN_IP4="$(echo "$FULL_STATUS" | grep -iE '^[[:space:]]*IPv4:' | head -1 | awk '{print $2}')"
+# Parse fields with awk-based functions (no-fail on missing keys)
+RELAY_INFO="$(parse_relay_line "$FULL_STATUS")"
+RELAY_NAME="$(echo "$RELAY_INFO" | awk -F'|' '{print $1}')"
+ENTRY_NAME="$(echo "$RELAY_INFO" | awk -F'|' '{print $2}')"
+LOCATION="$(parse_status_field "$FULL_STATUS" "Visible location")"
+TUN_IP4="$(parse_status_field "$FULL_STATUS" "IPv4")"
 
-# Feature detection
+# Feature detection (case-insensitive substring match — never fails)
 OBF_RAW="none"
-echo "$FULL_STATUS" | grep -qi "quic"        && OBF_RAW="quic"
-echo "$FULL_STATUS" | grep -qi "shadowsocks" && OBF_RAW="shadowsocks"
-echo "$FULL_STATUS" | grep -qi "udp2tcp"     && OBF_RAW="udp2tcp"
-echo "$FULL_STATUS" | grep -qi "lwo"         && OBF_RAW="lwo"
+case "$(echo "$FULL_STATUS" | tr '[:upper:]' '[:lower:]')" in
+    *quic*)        OBF_RAW="quic" ;;
+esac
+case "$(echo "$FULL_STATUS" | tr '[:upper:]' '[:lower:]')" in
+    *shadowsocks*) OBF_RAW="shadowsocks" ;;
+esac
+case "$(echo "$FULL_STATUS" | tr '[:upper:]' '[:lower:]')" in
+    *udp2tcp*|*udp-over-tcp*) OBF_RAW="udp2tcp" ;;
+esac
+case "$(echo "$FULL_STATUS" | tr '[:upper:]' '[:lower:]')" in
+    *lwo*|*lightweight*)      OBF_RAW="lwo" ;;
+esac
 
 DAITA_ST="off"
-echo "$FULL_STATUS" | grep -qi "daita" && DAITA_ST="on"
+if echo "$FULL_STATUS" | grep -qi "daita"; then DAITA_ST="on"; fi
 QUANTUM_ST="off"
-echo "$FULL_STATUS" | grep -qi "quantum" && QUANTUM_ST="on"
+if echo "$FULL_STATUS" | grep -qi "quantum"; then QUANTUM_ST="on"; fi
 MULTIHOP="off"
-[ -n "$ENTRY_NAME" ] && MULTIHOP="on"
-echo "$FULL_STATUS" | grep -qi "multihop" && MULTIHOP="on"
+if [ -n "$ENTRY_NAME" ]; then MULTIHOP="on"; fi
+if echo "$FULL_STATUS" | grep -qi "multihop"; then MULTIHOP="on"; fi
 
 # Engage host kill-switch only after verified connection
 LOCKDOWN_ST="off"
@@ -542,24 +573,20 @@ if [ "$ENABLE_LOCKDOWN" = "1" ] && [ "$STATE" = "connected" ]; then
     fi
 fi
 
-# Annotated values for the report
 OBF_DESC="$(obf_descriptor "$OBF_RAW")"
 MSS_DESC="$(mss_descriptor "$MSS_CLAMP")"
 MTU_DESC="$(mtu_descriptor "$WG_MTU")"
 
-# Connection-established banner (matches README style)
 echo ""
 echo "[$(date)] ✅ Connection Established!"
-
-# Comprehensive status report
 echo ""
 echo "══════════════════════════ STATUS REPORT ══════════════════════════"
 printf "  %-14s %s\n" "STATE:"       "$STATE"
-[ -n "$RELAY_NAME" ] && printf "  %-14s %s\n" "RELAY:"       "$RELAY_NAME"
-[ -n "$ENTRY_NAME" ] && printf "  %-14s %s\n" "ENTRY (hop):" "$ENTRY_NAME"
-[ -n "$LOCATION" ]   && printf "  %-14s %s\n" "LOCATION:"    "$LOCATION"
+if [ -n "$RELAY_NAME" ]; then printf "  %-14s %s\n" "RELAY:"       "$RELAY_NAME"; fi
+if [ -n "$ENTRY_NAME" ]; then printf "  %-14s %s\n" "ENTRY (hop):" "$ENTRY_NAME"; fi
+if [ -n "$LOCATION"   ]; then printf "  %-14s %s\n" "LOCATION:"    "$LOCATION";   fi
 printf "  %-14s %s\n" "PUBLIC IP:"   "$IP"
-[ -n "$TUN_IP4" ]    && printf "  %-14s %s\n" "TUNNEL IPv4:" "$TUN_IP4"
+if [ -n "$TUN_IP4"    ]; then printf "  %-14s %s\n" "TUNNEL IPv4:" "$TUN_IP4";    fi
 printf "  %-14s %s\n" "INTERFACE:"   "$WG_IF"
 echo  "  ─────────────────────────────────────────────────────────────"
 printf "  %-14s %s (%s)\n" "OBFUSCATION:" "$OBF_RAW"   "$OBF_DESC"
@@ -578,7 +605,8 @@ echo "════════════════════════�
 # --- WATCHDOG ---
 (
 exec -a "$WATCHDOG_TAG" bash <<EOF_WATCHDOG
-set -uo pipefail
+# No -e, no pipefail, no ERR trap — same reasoning as parent.
+set -u
 LAN_IF='$LAN_IF'
 WG_MTU=$WG_MTU
 MSS_CLAMP=$MSS_CLAMP
@@ -600,7 +628,7 @@ log "👁️  Watchdog active (IF=\$CURRENT_IF country=\$CURRENT_COUNTRY)"
 
 cleanup_iface() {
     local IF="\$1"
-    [ -z "\$IF" ] && return
+    if [ -z "\$IF" ]; then return 0; fi
     iptables    -D FORWARD -i "\$LAN_IF" -o "\$IF" -j ACCEPT 2>/dev/null || true
     iptables -t nat -D POSTROUTING -o "\$IF" -j MASQUERADE   2>/dev/null || true
     conntrack -F 2>/dev/null || true
@@ -609,20 +637,20 @@ cleanup_iface() {
 reapply_rules() {
     local NEW_IF="\$1"
     ip link set dev "\$NEW_IF" mtu "\$WG_MTU" 2>/dev/null || true
-    iptables    -A FORWARD -i "\$LAN_IF" -o "\$NEW_IF" -j ACCEPT
-    iptables -t nat -A POSTROUTING -o "\$NEW_IF" -j MASQUERADE
+    iptables    -A FORWARD -i "\$LAN_IF" -o "\$NEW_IF" -j ACCEPT 2>/dev/null || true
+    iptables -t nat -A POSTROUTING -o "\$NEW_IF" -j MASQUERADE 2>/dev/null || true
     iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN \
         -j TCPMSS --set-mss "\$MSS_CLAMP" 2>/dev/null \
         || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN \
-            -j TCPMSS --set-mss "\$MSS_CLAMP"
+            -j TCPMSS --set-mss "\$MSS_CLAMP" 2>/dev/null || true
     iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN \
         -o "\$NEW_IF" -j TCPMSS --set-mss "\$MSS_CLAMP" 2>/dev/null \
         || iptables -t mangle -A OUTPUT  -p tcp --tcp-flags SYN,RST SYN \
-            -o "\$NEW_IF" -j TCPMSS --set-mss "\$MSS_CLAMP"
+            -o "\$NEW_IF" -j TCPMSS --set-mss "\$MSS_CLAMP" 2>/dev/null || true
     iptables -C FORWARD -i "\$LAN_IF" -p udp --dport 53 ! -o "\$NEW_IF" -j DROP 2>/dev/null \
-        || iptables -A FORWARD -i "\$LAN_IF" -p udp --dport 53 ! -o "\$NEW_IF" -j DROP
+        || iptables -A FORWARD -i "\$LAN_IF" -p udp --dport 53 ! -o "\$NEW_IF" -j DROP 2>/dev/null || true
     iptables -C FORWARD -i "\$LAN_IF" -p tcp --dport 53 ! -o "\$NEW_IF" -j DROP 2>/dev/null \
-        || iptables -A FORWARD -i "\$LAN_IF" -p tcp --dport 53 ! -o "\$NEW_IF" -j DROP
+        || iptables -A FORWARD -i "\$LAN_IF" -p tcp --dport 53 ! -o "\$NEW_IF" -j DROP 2>/dev/null || true
     modprobe sch_cake 2>/dev/null || true
     tc qdisc del dev "\$LAN_IF" root 2>/dev/null || true
     tc qdisc add dev "\$LAN_IF" root cake bandwidth "\$CAKE_BW" nat wash ack-filter 2>/dev/null || true
@@ -638,7 +666,9 @@ while true; do
             HEALTHY=false
         fi
     fi
-    \$HEALTHY && ! ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1 && HEALTHY=false
+    if \$HEALTHY; then
+        if ! ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then HEALTHY=false; fi
+    fi
 
     if \$HEALTHY; then
         if [ \$FAIL_COUNT -ne 0 ] || [ \$BACKOFF_LEVEL -ne 0 ]; then
@@ -651,20 +681,22 @@ while true; do
 
     FAIL_COUNT=\$((FAIL_COUNT + 1))
     log "⚠️  Connection drop detected (\$FAIL_COUNT/\$THRESHOLD)"
-    [ \$FAIL_COUNT -lt \$THRESHOLD ] && continue
+    if [ \$FAIL_COUNT -lt \$THRESHOLD ]; then continue; fi
 
-    [ -n "\$CURRENT_COUNTRY" ] && echo "\$(date +%s) \$CURRENT_COUNTRY" >> "\$BAN_FILE"
+    if [ -n "\$CURRENT_COUNTRY" ]; then
+        echo "\$(date +%s) \$CURRENT_COUNTRY" >> "\$BAN_FILE"
+    fi
     cleanup_iface "\$CURRENT_IF"
 
     NOW=\$(date +%s)
     EXPIRY=\$((NOW - 28800))
-    [ -f "\$BAN_FILE" ] && {
-        awk -v expiry="\$EXPIRY" '\$1 > expiry' "\$BAN_FILE" > "\${BAN_FILE}.tmp" \
+    if [ -f "\$BAN_FILE" ]; then
+        awk -v expiry="\$EXPIRY" '\$1 > expiry' "\$BAN_FILE" > "\${BAN_FILE}.tmp" 2>/dev/null \
             && mv "\${BAN_FILE}.tmp" "\$BAN_FILE"
-    }
+    fi
     AVAILABLE=()
     for c in "\${ALLOWED_COUNTRIES[@]}"; do
-        grep -q " \$c\$" "\$BAN_FILE" 2>/dev/null || AVAILABLE+=("\$c")
+        if ! grep -q " \$c\$" "\$BAN_FILE" 2>/dev/null; then AVAILABLE+=("\$c"); fi
     done
     if [ "\${#AVAILABLE[@]}" -eq 0 ]; then
         : > "\$BAN_FILE"
@@ -689,10 +721,15 @@ while true; do
         sleep 2
 
         STATE_J="\$(mullvad status --json 2>/dev/null || echo '{}')"
-        if echo "\$STATE_J" | grep -qE '"state"[[:space:]]*:[[:space:]]*"connected"' \
-            || mullvad status 2>/dev/null | head -1 | grep -qi "connected"; then
+        STATE_OK=false
+        if echo "\$STATE_J" | grep -qE '"state"[[:space:]]*:[[:space:]]*"connected"'; then
+            STATE_OK=true
+        elif mullvad status 2>/dev/null | head -1 | grep -qi "connected"; then
+            STATE_OK=true
+        fi
 
-            NEW_IF="\$(ip -br link show 2>/dev/null | grep -oE 'wg[0-9]?-mullvad' | head -1)"
+        if \$STATE_OK; then
+            NEW_IF="\$(ip -br link show 2>/dev/null | awk '/wg[0-9]?-mullvad/ {print \$1; exit}')"
             if [ -n "\$NEW_IF" ]; then
                 reapply_rules "\$NEW_IF"
                 echo "\$NEW_IF" > /var/tmp/mullvad_current_if
@@ -723,13 +760,14 @@ EOF_WATCHDOG
 WATCHDOG_PID=$!
 echo "$WATCHDOG_PID" > "$WATCHDOG_PIDFILE"
 
-trap - ERR
+# Drop signal traps now — setup is done, watchdog runs independently
 trap - INT TERM
 echo ""
 echo "[$(date)] 👁️  Watchdog launched (PID: $WATCHDOG_PID)"
 echo "[$(date)] 🚀 Gateway ready"
 echo ""
-echo "  📜 Logs:    tail -f $LOG_FILE"
-echo "  🔧 Service: cp mullvad-gateway.service /etc/systemd/system/"
-echo "              systemctl daemon-reload && systemctl enable mullvad-gateway"
+echo "  📜 Logs:     tail -f $LOG_FILE"
+echo "  🛑 Teardown: sudo bash teardown-mullvad-gateway.sh"
+echo "  🔧 Service:  cp mullvad-gateway.service /etc/systemd/system/"
+echo "               systemctl daemon-reload && systemctl enable mullvad-gateway"
 echo ""
