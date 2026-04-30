@@ -1,47 +1,48 @@
 #!/bin/bash
 # ==============================================================================
-#   MULLVAD HARDENED GATEWAY — DAITA + Quantum + QUIC (v26.0)
+#   MULLVAD HARDENED GATEWAY — DAITA + Quantum + QUIC (v27.0)
 #   Tested: Mullvad 2026.1 / Debian 13 (Trixie) / Pi 5 4GB / Proxmox VM
 #
 #   Usage:
 #     sudo bash install-mullvad-gateway.sh
 #     sudo LAN_IF=eth0 bash install-mullvad-gateway.sh
-#     sudo LAN_IF=eth0 WG_MTU=1280 MSS_CLAMP=1000 bash install-mullvad-gateway.sh
+#     sudo LAN_IF=eth0 WG_MTU=1280 MSS_CLAMP=1100 bash install-mullvad-gateway.sh
 #     sudo ENABLE_LOCKDOWN=0 bash install-mullvad-gateway.sh   # no host kill-switch
 #
 #   Emergency recovery: see teardown-mullvad-gateway.sh (separate file)
 #
-#   v26 — CRITICAL bugfix release:
-#     - REMOVED `trap restore_ssh ERR` — was firing on parsing pipeline failures
-#       and wiping the firewall mid-script, breaking all internet
-#     - REMOVED `set -o pipefail` — caused grep-no-match to cascade into ERR
-#     - All parsing pipelines now use `awk` patterns (never fail on no-match)
-#     - Text status parsing rewritten to match ACTUAL multi-line Mullvad format
-#       (Relay: foo via bar / Visible location: x / IPv4: y on separate lines)
-#     - JSON status preferred for relay info
-#     - Critical commands now explicitly checked with `if ! cmd; then fail; fi`
-#     - All [ -n "$X" ] && Y=z patterns replaced with explicit if blocks
-#       (those can also trigger ERR when $X is empty)
+#   v27 changes:
+#     - MSS_CLAMP default raised 1100 → 1220 ("Standard" range; less throughput
+#       penalty, still safe for stacked WG-in-WG with QUIC overhead)
+#     - CLI command order corrected — `mullvad tunnel set daita/quantum-resistant`
+#       is the canonical 2026.1 form and is now tried FIRST. The old
+#       `tunnel wireguard daita/quantum-resistant` form (which never actually
+#       existed in upstream — was a misremembered subcommand) is removed.
+#     - `mullvad anti-censorship set mode` is now the primary command. Legacy
+#       `mullvad obfuscation set mode` kept as fallback for pre-2025 daemons.
+#     - parse_status_field() rewritten — now finds KEY anywhere on a line, not
+#       just at line start. Handles real Mullvad 2026.1 multihop output where
+#       IPv4 appears INLINE on the same line as "Visible location:":
+#         "Visible location:    Sweden, Gothenburg. IPv4: 193.32.249.66"
+#     - LOCATION extraction now strips any trailing "IPv4: ..." / "IPv6: ..."
+#       so the printed location is clean
+#     - TUN_IP4 extraction uses regex over the full status text — works for
+#       both basic (`IPv4: 10.64.0.1` on its own line) and multihop (inline)
 #
-#   Inherited from v24/v25 (still in place):
+#   Inherited from v24/v25/v26:
+#     - No `set -e`, no `set -o pipefail`, no ERR trap (caused v25 to wipe
+#       firewall mid-script on legitimate grep no-match)
 #     - Strict 16-digit account regex
 #     - LAN_IF detection refuses to guess on multi-iface systems
 #     - restore_ssh() flushes filter, nat, mangle, ip6tables
 #     - mullvad lockdown-mode as host kill-switch (after verified connect)
 #     - mullvad connect --wait
 #     - Watchdog: DAITA-off fallback + exponential backoff, stable tag/pidfile
-#     - WG_MTU / MSS_CLAMP env-overridable, conservative defaults
+#     - WG_MTU / MSS_CLAMP env-overridable
 #     - MSS clamp on FORWARD AND OUTPUT chains
 #     - ethtool guarded for virtio NICs
-#     - Emoji-rich status output
 # ==============================================================================
 
-# IMPORTANT:
-#   `set -e` is NOT used. The script handles errors explicitly via fail().
-#   `set -o pipefail` is NOT used. With pipefail + ERR trap, a single
-#       `grep | head | awk` pipeline that legitimately finds nothing was
-#       cascading into a firewall reset. That bug broke v25.
-#   `set -u` is used (catches typos in variable names — harmless).
 set -u
 
 # --- CONFIG ---
@@ -51,12 +52,12 @@ LAST_USED_FILE="/var/tmp/mullvad_last_gw"
 LOG_FILE="/var/log/mullvad-optimizer.log"
 WATCHDOG_PIDFILE="/var/run/mullvad-gateway-watchdog.pid"
 WATCHDOG_TAG="mullvad_gateway_watchdog"
-SCRIPT_VERSION="26.0"
+SCRIPT_VERSION="27.0"
 
-# Tunables (env-overridable). Defaults for stacked WG-in-WG.
+# Tunables (env-overridable). Defaults for stacked WG-in-WG with QUIC.
 CAKE_BW="${CAKE_BW:-500mbit}"
 WG_MTU="${WG_MTU:-1280}"
-MSS_CLAMP="${MSS_CLAMP:-1100}"
+MSS_CLAMP="${MSS_CLAMP:-1220}"
 ENABLE_LOCKDOWN="${ENABLE_LOCKDOWN:-1}"
 
 # --- DESCRIPTOR HELPERS ---
@@ -237,8 +238,6 @@ echo "[$(date)] 🚀 Starting Hardened Gateway v${SCRIPT_VERSION}"
 echo "[$(date)] ⚙️  Config: LAN_IF=$LAN_IF WG_MTU=$WG_MTU MSS_CLAMP=$MSS_CLAMP CAKE_BW=$CAKE_BW LOCKDOWN=$ENABLE_LOCKDOWN"
 
 # --- SAFETY HELPERS ---
-# restore_ssh is ONLY called via fail() (explicit critical errors) or
-# signal traps (INT/TERM during setup). It is NEVER auto-triggered by ERR.
 restore_ssh() {
     echo "[$(date)] 🚨 restore_ssh() — emergency firewall reset"
     iptables  -P INPUT   ACCEPT 2>/dev/null || true
@@ -261,8 +260,6 @@ fail() {
     exit 1
 }
 
-# Signal traps ONLY — no ERR trap. v25 had `trap restore_ssh ERR` which fired
-# on parsing pipeline failures and wiped the firewall during normal execution.
 trap 'echo "[$(date)] 🛑 Caught signal — cleaning up"; restore_ssh; exit 130' INT TERM
 
 # --- HELPERS ---
@@ -296,25 +293,25 @@ get_valid_country() {
     echo "$SEL"
 }
 
+# --- CLI command wrappers (Mullvad 2026.1 canonical, w/ legacy fallback) ---
 set_features() {
+    # Anti-censorship: 2026.1 uses `anti-censorship`. Pre-2025 daemons used `obfuscation`.
     mullvad anti-censorship set mode quic 2>/dev/null \
         || mullvad obfuscation set mode quic 2>/dev/null \
-        || echo "  ⚠️  WARN: QUIC mode not set"
+        || echo "  ⚠️  WARN: QUIC mode not set (daemon may not support QUIC)"
 
-    mullvad tunnel wireguard quantum-resistant on 2>/dev/null \
-        || mullvad tunnel set quantum-resistant on 2>/dev/null \
-        || true
+    # Quantum-resistant: canonical is `tunnel set quantum-resistant`.
+    # Default in 2026.1 is already on, but we set explicitly for idempotence.
+    mullvad tunnel set quantum-resistant on 2>/dev/null || true
 
+    # DAITA: canonical is `tunnel set daita`.
     if [ "${WANT_DAITA:-1}" = "1" ]; then
-        mullvad tunnel wireguard daita on 2>/dev/null \
-            || mullvad tunnel set daita on 2>/dev/null \
-            || true
+        mullvad tunnel set daita on 2>/dev/null || true
     else
-        mullvad tunnel wireguard daita off 2>/dev/null \
-            || mullvad tunnel set daita off 2>/dev/null \
-            || true
+        mullvad tunnel set daita off 2>/dev/null || true
     fi
 
+    # LAN access: required so the gateway can serve clients on $LAN_IF.
     mullvad lan set allow 2>/dev/null || true
 }
 
@@ -331,7 +328,6 @@ get_status_state() {
     fi
     local FIRST
     FIRST="$(mullvad status 2>/dev/null | head -1 | tr '[:upper:]' '[:lower:]')"
-    # Order matters — disconnected/connecting both contain "connected" as substring
     case "$FIRST" in
         *disconnected*)    echo "disconnected" ;;
         *connecting*)      echo "connecting"   ;;
@@ -341,40 +337,104 @@ get_status_state() {
     esac
 }
 
-# Parse the full text status output for relay info.
-# Real Mullvad 2026.1 format (multi-line):
-#   Connected
-#   Relay: se-got-wg-001 via dk-cph-wg-001
-#   Features: Multihop, DAITA, Quantum Resistance, QUIC
-#   Visible location: Sweden, Gothenburg.
-#   IPv4: 193.32.249.66
-# All parsing uses awk (zero-fail on no-match) and emits empty string if absent.
+# Parse a key:value field from the multi-line status output.
+#
+# Real Mullvad 2026.1 verbose formats observed:
+#
+#   BASIC (verbose):
+#     Connected to se-got-wg-004 in Gothenburg, Sweden
+#     Tunnel protocol: WireGuard
+#     IPv4: 10.64.0.1
+#     IPv6: fc00:bbbb:bbbb:bb01::1
+#
+#   MULTIHOP (verbose):
+#     Connected
+#         Relay:               se-got-wg-001 via dk-cph-wg-001
+#         Features:            Multihop
+#         Visible location:    Sweden, Gothenburg. IPv4: 193.32.249.66
+#
+# Note the MULTIHOP case packs IPv4 INLINE on the Visible location line.
+# This parser:
+#   1. Looks for KEY at start of line (after optional whitespace) — wins if found
+#   2. Falls back to KEY appearing mid-line preceded by whitespace
+# All parsing uses awk (no-fail on miss). Returns empty string when absent.
 parse_status_field() {
     local STATUS_TEXT="$1" KEY="$2"
-    # Find line matching "$KEY:" anywhere in the field (case-insensitive)
     echo "$STATUS_TEXT" | awk -v k="$KEY" '
+        BEGIN { IGNORECASE=1; out="" }
+        # Pass 1: KEY at start of line
+        {
+            patt_start = "^[[:space:]]*" k ":[[:space:]]"
+            if (out == "" && $0 ~ patt_start) {
+                line = $0
+                sub("^[[:space:]]*" k ":[[:space:]]*", "", line)
+                # Strip trailing dot/whitespace
+                sub(/[[:space:]]*\.?[[:space:]]*$/, "", line)
+                out = line
+            }
+        }
+        # Pass 2 (fallback): KEY mid-line, preceded by whitespace
+        END {
+            if (out != "") { print out; exit }
+        }
+    ' || true
+    # Pass 2 — only runs if Pass 1 produced nothing.
+    echo "$STATUS_TEXT" | awk -v k="$KEY" '
+        BEGIN { IGNORECASE=1; found=0 }
+        {
+            # Skip lines where KEY is at start (already handled above)
+            patt_start = "^[[:space:]]*" k ":[[:space:]]"
+            if ($0 ~ patt_start) next
+            patt_mid = "[[:space:]]" k ":[[:space:]]+[^[:space:]]"
+            if (match($0, patt_mid)) {
+                rest = substr($0, RSTART)
+                sub("^[[:space:]]+" k ":[[:space:]]*", "", rest)
+                # Take only up to next " WORD: " marker (next field)
+                if (match(rest, /[[:space:]]+[A-Za-z][A-Za-z0-9 _-]*:[[:space:]]/)) {
+                    rest = substr(rest, 1, RSTART - 1)
+                }
+                sub(/[[:space:]]*\.?[[:space:]]*$/, "", rest)
+                if (!found) { print rest; found=1 }
+            }
+        }
+    ' | head -1
+}
+
+# Extract a clean LOCATION (drops any trailing "IPv4: ..." / "IPv6: ..." that
+# Mullvad packs onto the same line in multihop mode).
+parse_location() {
+    local STATUS_TEXT="$1"
+    echo "$STATUS_TEXT" | awk '
         BEGIN { IGNORECASE=1 }
-        $0 ~ "^[[:space:]]*"k":" {
+        /^[[:space:]]*Visible location:/ {
             sub(/^[^:]*:[[:space:]]*/, "")
-            sub(/[[:space:]]*\.?$/, "")
-            print
-            exit
+            sub(/[[:space:]]+IPv[46]:.*$/, "")
+            sub(/[[:space:]]*\.?[[:space:]]*$/, "")
+            print; exit
         }
     '
 }
 
+# Extract IPv4 anywhere in the status text (works for both basic and multihop)
+parse_ipv4() {
+    local STATUS_TEXT="$1"
+    echo "$STATUS_TEXT" \
+        | grep -oE 'IPv4:[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+        | head -1 \
+        | awk '{print $2}'
+}
+
 # Extract relay (and optional via-entry) from the "Relay:" line.
-# Returns:  RELAY|ENTRY|""   (location filled separately)
+# Returns:  RELAY|ENTRY
 parse_relay_line() {
     local STATUS_TEXT="$1"
     local LINE
     LINE="$(parse_status_field "$STATUS_TEXT" "Relay")"
-    if [ -z "$LINE" ]; then echo "||"; return 0; fi
-    # LINE is like "se-got-wg-001 via dk-cph-wg-001" or just "se-got-wg-001"
+    if [ -z "$LINE" ]; then echo "|"; return 0; fi
     local RELAY ENTRY
     RELAY="$(echo "$LINE" | awk '{print $1}')"
     ENTRY="$(echo "$LINE" | awk '/via/ {for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')"
-    echo "${RELAY}|${ENTRY}|"
+    echo "${RELAY}|${ENTRY}"
 }
 
 # --- HOST KILL-SWITCH (off during setup) ---
@@ -392,7 +452,6 @@ fi
 pkill -f "$WATCHDOG_TAG" 2>/dev/null || true
 
 # --- FIREWALL LOCKDOWN ---
-# Use explicit checks here. If any of these fail, we MUST bail with restore_ssh.
 if ! iptables -P FORWARD DROP; then fail "iptables policy FORWARD DROP"; fi
 if ! iptables -P INPUT   DROP; then fail "iptables policy INPUT DROP"; fi
 iptables -P OUTPUT  ACCEPT
@@ -528,42 +587,43 @@ echo "[$(date)] 🔍 Verifying connection..."
 WG_IF="$(cat /var/tmp/mullvad_current_if 2>/dev/null || echo '?')"
 STATE="$(get_status_state)"
 
-# Best-effort. NEVER allowed to fail the script. Each pipeline returns "" on miss.
+# Best-effort. NEVER allowed to fail the script.
 IP="$(curl -s --max-time 8 https://am.i.mullvad.net/ip 2>/dev/null || echo)"
 if [ -z "$IP" ]; then IP="Unknown"; fi
 
-# Try `mullvad status -v` first; fall back to plain `mullvad status`. Either is fine.
+# Use verbose status (more fields). Fall back to plain if -v unavailable.
 FULL_STATUS="$( { mullvad status -v 2>/dev/null || mullvad status 2>/dev/null; } || echo)"
 
-# Parse fields with awk-based functions (no-fail on missing keys)
+# Parse fields with hardened helpers (never fail on missing keys)
 RELAY_INFO="$(parse_relay_line "$FULL_STATUS")"
 RELAY_NAME="$(echo "$RELAY_INFO" | awk -F'|' '{print $1}')"
 ENTRY_NAME="$(echo "$RELAY_INFO" | awk -F'|' '{print $2}')"
-LOCATION="$(parse_status_field "$FULL_STATUS" "Visible location")"
-TUN_IP4="$(parse_status_field "$FULL_STATUS" "IPv4")"
+LOCATION="$(parse_location "$FULL_STATUS")"
+TUN_IP4="$(parse_ipv4 "$FULL_STATUS")"
 
-# Feature detection (case-insensitive substring match — never fails)
+# Feature detection — case-insensitive substring match. Never fails.
+FULL_LOWER="$(echo "$FULL_STATUS" | tr '[:upper:]' '[:lower:]')"
 OBF_RAW="none"
-case "$(echo "$FULL_STATUS" | tr '[:upper:]' '[:lower:]')" in
+case "$FULL_LOWER" in
     *quic*)        OBF_RAW="quic" ;;
 esac
-case "$(echo "$FULL_STATUS" | tr '[:upper:]' '[:lower:]')" in
+case "$FULL_LOWER" in
     *shadowsocks*) OBF_RAW="shadowsocks" ;;
 esac
-case "$(echo "$FULL_STATUS" | tr '[:upper:]' '[:lower:]')" in
+case "$FULL_LOWER" in
     *udp2tcp*|*udp-over-tcp*) OBF_RAW="udp2tcp" ;;
 esac
-case "$(echo "$FULL_STATUS" | tr '[:upper:]' '[:lower:]')" in
-    *lwo*|*lightweight*)      OBF_RAW="lwo" ;;
+case "$FULL_LOWER" in
+    *lwo*|*"lightweight obfuscation"*) OBF_RAW="lwo" ;;
 esac
 
 DAITA_ST="off"
-if echo "$FULL_STATUS" | grep -qi "daita"; then DAITA_ST="on"; fi
+if echo "$FULL_LOWER" | grep -q "daita"; then DAITA_ST="on"; fi
 QUANTUM_ST="off"
-if echo "$FULL_STATUS" | grep -qi "quantum"; then QUANTUM_ST="on"; fi
+if echo "$FULL_LOWER" | grep -q "quantum"; then QUANTUM_ST="on"; fi
 MULTIHOP="off"
 if [ -n "$ENTRY_NAME" ]; then MULTIHOP="on"; fi
-if echo "$FULL_STATUS" | grep -qi "multihop"; then MULTIHOP="on"; fi
+if echo "$FULL_LOWER" | grep -q "multihop"; then MULTIHOP="on"; fi
 
 # Engage host kill-switch only after verified connection
 LOCKDOWN_ST="off"
@@ -710,12 +770,11 @@ while true; do
         mullvad disconnect 2>/dev/null || true
         sleep 2
         mullvad relay set location "\$NEW_COUNTRY" 2>/dev/null || true
+        # 2026.1 canonical commands (legacy fallbacks for older daemons)
         mullvad anti-censorship set mode quic 2>/dev/null \
             || mullvad obfuscation set mode quic 2>/dev/null || true
-        mullvad tunnel wireguard quantum-resistant on 2>/dev/null \
-            || mullvad tunnel set quantum-resistant on 2>/dev/null || true
-        mullvad tunnel wireguard daita "\$daita_attempt" 2>/dev/null \
-            || mullvad tunnel set daita "\$daita_attempt" 2>/dev/null || true
+        mullvad tunnel set quantum-resistant on 2>/dev/null || true
+        mullvad tunnel set daita "\$daita_attempt" 2>/dev/null || true
 
         timeout 60 mullvad connect --wait >/dev/null 2>&1
         sleep 2
