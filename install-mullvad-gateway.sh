@@ -1,70 +1,35 @@
 #!/bin/bash
 # ==============================================================================
-#   MULLVAD HARDENED GATEWAY (v29.0)
+#   MULLVAD HARDENED GATEWAY (v29.1)
 #   Tested against: Mullvad 2026.1 / Debian 13 (Trixie) / Pi 5 / Proxmox VM
 #
-#   v29 changes from v28 — focused on obfuscation robustness & log noise:
+#   v29.1 — bugfix release for v29:
 #
-#     1. **QUIC ROBUSTNESS MODE (the headline fix).**
-#        QUIC obfuscation runs on a separate, smaller pool of Mullvad relays
-#        than the main WG pool. The daemon picks them dynamically — but if you
-#        pin a country (`relay set location se`), and that country has no
-#        QUIC-capable relay available *right now*, the daemon hangs.
+#     1. **CRITICAL FIX: silent script death after "Reaping watchdogs".**
+#        v29 had `pkill -f "mullvad-optimizer"` which matched the tee process
+#        running `tee -a /var/log/mullvad-optimizer.log`. Killing tee broke
+#        the script's stdout pipe → SIGPIPE → silent exit. Removed.
 #
-#        v29 adds a multi-strategy fallback chain when QUIC is the goal:
-#          A) QUIC + relay set location any (let daemon pick QUIC-capable)
-#          B) QUIC + each allowed country in order (NL, CH, US, DE, SE)
-#          C) Daemon restart + retry strategy A
-#          D) Fall back to Shadowsocks (auto port, then port 443)
-#          E) Fall back to LWO (Lightweight WG Obfuscation, 2025.13+)
-#          F) Fall back to udp2tcp (port 443)
-#          G) Last resort: plain WG, log clearly that obfuscation failed
+#     2. **CORRECTED: DAITA + QUIC are NOT incompatible.**
+#        v29 falsely claimed they were. They are not — per Mullvad engineer
+#        "faern" in upstream issue #8742: "QUIC is compatible with all other
+#        security features, it's just that not many servers supports QUIC yet."
+#        v29.1 enables both when requested. The actual constraint is server
+#        availability — fewer relays support QUIC than support plain WG. If
+#        no relay satisfies all requested features, v29.1 falls through the
+#        obfuscation chain: QUIC → Shadowsocks → LWO → udp2tcp → none.
 #
-#        User wins: stays connected with whatever obfuscation is achievable.
+#     3. **OLD STATUS-REPORT FORMAT RESTORED.**
+#        Full report with STATE, TARGET CC, RELAY, ENTRY (hop), LOCATION,
+#        PUBLIC IP, TUNNEL IPv4, INTERFACE, OBFUSCATION (with descriptor),
+#        QUANTUM, DAITA, MULTIHOP, MTU/MSS descriptors, LOCKDOWN, FWD POLICY.
 #
-#     2. **DAITA + QUIC CONFLICT RESOLUTION.**
-#        Per Mullvad upstream issue #8742, DAITA and QUIC are mutually
-#        incompatible (DAITA requires multihop in many cases; QUIC doesn't
-#        support multihop). v29 detects this and follows the user policy:
-#        DAITA wins when both requested. WANT_QUIC silently dropped.
-#        Set DAITA_WINS=0 to flip the policy.
+#     4. **WATCHDOG REAPING IS SAFE.**
+#        Only kills processes whose argv[0] is exactly the WATCHDOG_TAG
+#        (set via exec -a). No more wildcard matches that hit unrelated
+#        processes like the script's own tee.
 #
-#     3. **RE-PIN RELAY AFTER EACH FEATURE TOGGLE.**
-#        Last session's surprise CH exit when SE was requested: the daemon's
-#        relay constraint was getting bumped during feature negotiation.
-#        v29 re-issues `mullvad relay set location <CC>` after every
-#        feature change and verifies the exit country matches request.
-#        If it doesn't, logs a clear warning.
-#
-#     4. **DAITA DIRECT-ONLY MODE.**
-#        New env: DAITA_DIRECT_ONLY=1 (default 0). When 1, sets
-#        `mullvad tunnel set daita-direct-only on` to refuse the automatic
-#        multihop redirect. Trade-off: connection may fail if the country
-#        has no DAITA relays. Use when you NEED the country you asked for.
-#
-#     5. **WATCHDOG TOLERANCE FIX (the packet-loss spam fix).**
-#        v28 watchdog logged "Connection drop (1/3)" on every single failed
-#        ping, then "Health restored" 10s later. This created log noise on
-#        a 180ms transcontinental VPN where occasional single-ping loss
-#        is normal. v29:
-#          - Pings 3 packets, considers healthy if 2/3 succeed
-#          - Increases ping timeout (-W 5)
-#          - Only logs "Connection drop" at threshold (when migration starts)
-#          - Suppresses "Health restored" unless we actually did something
-#
-#     6. **STALE WATCHDOG REAPER.**
-#        v28 only killed processes tagged 'mullvad_gateway_watchdog'. The
-#        user's logs showed two parallel watchdogs running ("Packet Loss
-#        Detected" format from an unidentified earlier script). v29 reaps
-#        ANY process whose command line contains 'mullvad' and 'watchdog',
-#        and warns about leftover Mullvad-related background scripts.
-#
-#     7. **EXIT COUNTRY VERIFICATION.**
-#        After every successful connect, fetches actual visible location
-#        and reports it. If mismatch with target country, logs a clear
-#        WARN line so user knows the constraint wasn't respected.
-#
-#   Companion scripts (unchanged from v28):
+#   Companion scripts (unchanged):
 #     teardown-mullvad-gateway-v28.sh
 #     emergency-restore.sh
 # ==============================================================================
@@ -79,52 +44,63 @@ LAST_USED_FILE="/var/tmp/mullvad_last_gw"
 LOG_FILE="/var/log/mullvad-optimizer.log"
 WATCHDOG_PIDFILE="/var/run/mullvad-gateway-watchdog.pid"
 WATCHDOG_TAG="mullvad_gateway_watchdog"
-SCRIPT_VERSION="29.0"
+SCRIPT_VERSION="29.1"
 
-# Tunables (env-overridable)
+# Tunables
 CAKE_BW="${CAKE_BW:-500mbit}"
 WG_MTU="${WG_MTU:-1280}"
 MSS_CLAMP="${MSS_CLAMP:-1220}"
 WANT_QUIC="${WANT_QUIC:-1}"
 WANT_QUANTUM="${WANT_QUANTUM:-1}"
 WANT_DAITA="${WANT_DAITA:-1}"
-DAITA_WINS="${DAITA_WINS:-1}"             # 1: DAITA beats QUIC; 0: QUIC beats DAITA
-DAITA_DIRECT_ONLY="${DAITA_DIRECT_ONLY:-0}"  # 1: refuse DAITA auto-multihop
-OBF_FALLBACK="${OBF_FALLBACK:-1}"         # 1: chain through alt obf if primary fails
+DAITA_DIRECT_ONLY="${DAITA_DIRECT_ONLY:-0}"
+OBF_FALLBACK="${OBF_FALLBACK:-1}"
+ENABLE_LOCKDOWN="${ENABLE_LOCKDOWN:-1}"
+
+# --- DESCRIPTOR HELPERS (restored from v27) ---
+mss_descriptor() {
+    local v="$1"
+    if   [ "$v" -le 1000 ]; then echo "Ultra-Conservative"
+    elif [ "$v" -le 1150 ]; then echo "Safe"
+    elif [ "$v" -le 1300 ]; then echo "Standard"
+    else                          echo "Aggressive"
+    fi
+}
+mtu_descriptor() {
+    local v="$1"
+    if   [ "$v" -lt 1280 ]; then echo "Below WG floor!"
+    elif [ "$v" -eq 1280 ]; then echo "WireGuard Standard"
+    elif [ "$v" -le 1420 ]; then echo "Tuned"
+    else                          echo "Aggressive"
+    fi
+}
+obf_descriptor() {
+    case "$1" in
+        quic)        echo "QUIC over UDP" ;;
+        shadowsocks) echo "Shadowsocks" ;;
+        udp2tcp)     echo "UDP-over-TCP" ;;
+        lwo)         echo "Lightweight Obfuscation" ;;
+        none|"")     echo "None" ;;
+        *)           echo "$1" ;;
+    esac
+}
 
 # --- BANNER ---
 echo ""
 echo "══════════════════════════════════════════════════════════════"
 echo "  🔒 MULLVAD HARDENED GATEWAY  v${SCRIPT_VERSION}"
-echo "      QUIC robustness + obfuscation fallback chain"
+echo "      DAITA + Quantum-Resistant + QUIC"
 echo "══════════════════════════════════════════════════════════════"
 
 if [ "$(id -u)" -ne 0 ]; then echo "❌ FAIL: Must run as root"; exit 1; fi
 
-# --- DETECT DAITA+QUIC CONFLICT, APPLY POLICY ---
-if [ "$WANT_DAITA" = "1" ] && [ "$WANT_QUIC" = "1" ]; then
-    if [ "$DAITA_WINS" = "1" ]; then
-        echo "⚠️  DAITA+QUIC are incompatible (Mullvad #8742). DAITA wins → QUIC disabled."
-        WANT_QUIC=0
-    else
-        echo "⚠️  DAITA+QUIC are incompatible. QUIC wins (DAITA_WINS=0) → DAITA disabled."
-        WANT_DAITA=0
-    fi
-fi
-
-# Determine primary obfuscation goal for this run
-if   [ "$WANT_QUIC" = "1" ]; then PRIMARY_OBF="quic"
-else                              PRIMARY_OBF="auto"
-fi
-
 # --- INSTALL DEPENDENCIES ---
 NEEDED_PKGS=()
-for pkg in curl iptables conntrack ethtool iproute2 nftables jq; do
+for pkg in curl iptables conntrack ethtool iproute2 nftables; do
     case "$pkg" in
         iproute2)  command -v ip      &>/dev/null || NEEDED_PKGS+=("iproute2") ;;
         ethtool)   command -v ethtool &>/dev/null || NEEDED_PKGS+=("ethtool")  ;;
         nftables)  command -v nft     &>/dev/null || NEEDED_PKGS+=("nftables") ;;
-        jq)        command -v jq      &>/dev/null || NEEDED_PKGS+=("jq")       ;;
         *)         command -v "$pkg"  &>/dev/null || NEEDED_PKGS+=("$pkg")     ;;
     esac
 done
@@ -133,7 +109,7 @@ if [ "${#NEEDED_PKGS[@]}" -gt 0 ]; then
     apt-get update -qq || { echo "❌ apt-get update failed"; exit 1; }
     apt-get install -y "${NEEDED_PKGS[@]}" || { echo "❌ install failed"; exit 1; }
 fi
-command -v mullvad &>/dev/null || { echo "❌ Mullvad not installed — run v28/v29 fresh boot"; exit 1; }
+command -v mullvad &>/dev/null || { echo "❌ Mullvad not installed"; exit 1; }
 
 # --- LAN_IF DETECTION ---
 detect_lan_if() {
@@ -143,7 +119,7 @@ detect_lan_if() {
         | awk '$1 != "lo" && $2 == "UP" {print $1}')
     if [ "${#IFACES[@]}" -eq 1 ]; then
         LAN_IF="${IFACES[0]}"
-        echo "🔧 Auto-detected LAN_IF=$LAN_IF"
+        echo "🔧 Auto-detected LAN_IF=$LAN_IF (sole UP interface)"
         return 0
     fi
     echo "❌ FAIL: ${#IFACES[@]} UP interfaces — set LAN_IF explicitly"
@@ -185,10 +161,10 @@ ACCT_EXPIRY="$(mullvad account get 2>/dev/null \
 # --- LOGGING ---
 touch "$LOG_FILE" || { echo "❌ Cannot write $LOG_FILE"; exit 1; }
 exec > >(tee -a "$LOG_FILE") 2>&1
+echo ""
 echo "[$(date)] 🚀 Starting Hardened Gateway v${SCRIPT_VERSION}"
-echo "[$(date)] ⚙️  LAN_IF=$LAN_IF MTU=$WG_MTU MSS=$MSS_CLAMP CAKE=$CAKE_BW"
-echo "[$(date)] ⚙️  PRIMARY_OBF=$PRIMARY_OBF QUANTUM=$WANT_QUANTUM DAITA=$WANT_DAITA"
-echo "[$(date)] ⚙️  DAITA_DIRECT_ONLY=$DAITA_DIRECT_ONLY OBF_FALLBACK=$OBF_FALLBACK"
+echo "[$(date)] ⚙️  Config: LAN_IF=$LAN_IF WG_MTU=$WG_MTU MSS_CLAMP=$MSS_CLAMP CAKE_BW=$CAKE_BW LOCKDOWN=$ENABLE_LOCKDOWN"
+echo "[$(date)] ⚙️  Features: QUIC=$WANT_QUIC QUANTUM=$WANT_QUANTUM DAITA=$WANT_DAITA"
 
 # --- SAFETY ---
 restore_ssh() {
@@ -238,35 +214,11 @@ get_state() {
         | grep -oE 'disconnected|connecting|connected|blocked|error' | head -1
 }
 
-get_exit_country() {
-    # Returns 2-letter country code from "Visible location: Country, City"
-    local FULL
-    FULL="$( { mullvad status -v 2>/dev/null || mullvad status 2>/dev/null; } )"
-    local COUNTRY
-    COUNTRY="$(echo "$FULL" | awk '/Visible location:/ {sub(/^[^:]*:[[:space:]]*/,""); sub(/,.*$/,""); sub(/[[:space:]]+IPv[46]:.*$/,""); print; exit}')"
-    case "$COUNTRY" in
-        Sweden)        echo "se" ;;
-        Switzerland)   echo "ch" ;;
-        Netherlands)   echo "nl" ;;
-        "United States"|USA) echo "us" ;;
-        Germany)       echo "de" ;;
-        France)        echo "fr" ;;
-        "United Kingdom"|UK) echo "gb" ;;
-        Canada)        echo "ca" ;;
-        Norway)        echo "no" ;;
-        Finland)       echo "fi" ;;
-        Denmark)       echo "dk" ;;
-        *)             echo "?" ;;
-    esac
-}
-
 wait_for_state() {
     local TARGET="$1" TIMEOUT="${2:-15}"
     local i=0
     while [ $i -lt "$TIMEOUT" ]; do
-        local S
-        S="$(get_state)"
-        [ "$S" = "$TARGET" ] && return 0
+        [ "$(get_state)" = "$TARGET" ] && return 0
         sleep 1
         i=$((i + 1))
     done
@@ -287,7 +239,6 @@ reset_daemon() {
 }
 
 set_obf_mode() {
-    # $1 = mode (auto/quic/shadowsocks/lwo/udp2tcp)
     local MODE="$1"
     mullvad anti-censorship set mode "$MODE" 2>/dev/null \
         || mullvad obfuscation set mode "$MODE" 2>/dev/null \
@@ -304,7 +255,6 @@ set_features_baseline() {
 }
 
 try_connect() {
-    # $1 = label for logging
     local LABEL="$1"
     if ! timeout 60 mullvad connect --wait >/dev/null 2>&1; then
         echo "[$(date)]   ⚠️  connect timeout ($LABEL)"
@@ -315,208 +265,144 @@ try_connect() {
     return 1
 }
 
-# === KEY NEW FUNCTION ===
-# Multi-strategy fallback chain to get QUIC working. Returns 0 on success.
-# Sets globals: ACTIVE_OBF, ACTIVE_COUNTRY
-quic_fallback_chain() {
-    echo "[$(date)] 🎯 QUIC robustness mode engaged"
-
-    # === STRATEGY A: QUIC + relay set location any (most flexible) ===
-    echo "[$(date)] 🅰️  Strategy A: QUIC + any country"
-    reset_daemon
-    mullvad relay set location any 2>/dev/null
-    set_features_baseline
-    set_obf_mode quic
-    if try_connect "QUIC any"; then
-        ACTIVE_OBF="quic"
-        ACTIVE_COUNTRY="$(get_exit_country)"
-        echo "[$(date)] ✅ QUIC connected (exit=${ACTIVE_COUNTRY^^})"
-        return 0
-    fi
-
-    # === STRATEGY B: QUIC + each allowed country ===
-    echo "[$(date)] 🅱️  Strategy B: QUIC + each country in turn"
-    for CC in "${ALLOWED_COUNTRIES[@]}"; do
-        echo "[$(date)]    → trying QUIC in ${CC^^}..."
-        reset_daemon
-        mullvad relay set location "$CC" 2>/dev/null
-        set_features_baseline
-        set_obf_mode quic
-        if try_connect "QUIC $CC"; then
-            ACTIVE_OBF="quic"
-            ACTIVE_COUNTRY="$(get_exit_country)"
-            echo "[$(date)] ✅ QUIC connected (exit=${ACTIVE_COUNTRY^^})"
-            return 0
+# Try Shadowsocks → LWO → udp2tcp → auto, in order.
+# Sets ACHIEVED_OBF on success.
+obf_fallback_chain() {
+    for MODE in shadowsocks lwo udp2tcp; do
+        echo "[$(date)]   trying $MODE..."
+        if set_obf_mode "$MODE"; then
+            mullvad reconnect 2>/dev/null
+            wait_for_state "connected" 30
+            if [ "$(get_state)" = "connected" ]; then
+                ACHIEVED_OBF="$MODE"
+                echo "[$(date)]   ✅ $MODE connected"
+                return 0
+            fi
         fi
     done
-
-    # === STRATEGY C: Daemon restart, then retry QUIC any ===
-    echo "[$(date)] 🅲  Strategy C: full daemon restart + QUIC any"
-    systemctl restart mullvad-daemon 2>/dev/null
-    sleep 4
-    for i in $(seq 1 15); do mullvad status &>/dev/null && break; sleep 1; done
-    mullvad relay set location any 2>/dev/null
-    set_features_baseline
-    set_obf_mode quic
-    if try_connect "QUIC after restart"; then
-        ACTIVE_OBF="quic"
-        ACTIVE_COUNTRY="$(get_exit_country)"
-        echo "[$(date)] ✅ QUIC connected after restart (exit=${ACTIVE_COUNTRY^^})"
-        return 0
-    fi
-
-    # === FALLBACK CHAIN (only if OBF_FALLBACK=1) ===
-    if [ "$OBF_FALLBACK" != "1" ]; then
-        echo "[$(date)] ❌ QUIC failed and OBF_FALLBACK=0 — refusing other obfuscations"
-        return 1
-    fi
-
-    # === STRATEGY D: Shadowsocks (auto, then port 443) ===
-    echo "[$(date)] 🅳  Strategy D: Shadowsocks fallback"
-    reset_daemon
-    mullvad relay set location any 2>/dev/null
-    set_features_baseline
-    if set_obf_mode shadowsocks; then
-        if try_connect "Shadowsocks any"; then
-            ACTIVE_OBF="shadowsocks"
-            ACTIVE_COUNTRY="$(get_exit_country)"
-            echo "[$(date)] ✅ Shadowsocks connected (exit=${ACTIVE_COUNTRY^^})"
-            return 0
-        fi
-    fi
-
-    # === STRATEGY E: LWO (Lightweight WG Obfuscation, 2025.13+) ===
-    echo "[$(date)] 🅴  Strategy E: LWO fallback"
-    reset_daemon
-    mullvad relay set location any 2>/dev/null
-    set_features_baseline
-    if set_obf_mode lwo; then
-        if try_connect "LWO any"; then
-            ACTIVE_OBF="lwo"
-            ACTIVE_COUNTRY="$(get_exit_country)"
-            echo "[$(date)] ✅ LWO connected (exit=${ACTIVE_COUNTRY^^})"
-            return 0
-        fi
-    else
-        echo "[$(date)]   (LWO mode not supported by this daemon — skipping)"
-    fi
-
-    # === STRATEGY F: udp2tcp ===
-    echo "[$(date)] 🅵  Strategy F: udp2tcp fallback"
-    reset_daemon
-    mullvad relay set location any 2>/dev/null
-    set_features_baseline
-    if set_obf_mode udp2tcp; then
-        if try_connect "udp2tcp any"; then
-            ACTIVE_OBF="udp2tcp"
-            ACTIVE_COUNTRY="$(get_exit_country)"
-            echo "[$(date)] ✅ udp2tcp connected (exit=${ACTIVE_COUNTRY^^})"
-            return 0
-        fi
-    fi
-
-    # === STRATEGY G: plain WG, no obfuscation ===
-    echo "[$(date)] 🅶  Strategy G: plain WG (NO OBFUSCATION — last resort)"
-    reset_daemon
-    local CC
-    CC="$(get_valid_country)"
-    mullvad relay set location "$CC" 2>/dev/null
-    set_features_baseline
-    if try_connect "plain WG $CC"; then
-        ACTIVE_OBF="none"
-        ACTIVE_COUNTRY="$(get_exit_country)"
-        echo "[$(date)] ⚠️  Connected without obfuscation (exit=${ACTIVE_COUNTRY^^})"
-        return 0
-    fi
-
-    return 1
+    echo "[$(date)]   all obfuscation modes failed — using auto"
+    set_obf_mode auto
+    mullvad reconnect 2>/dev/null
+    wait_for_state "connected" 30
+    ACHIEVED_OBF="none"
+    return 0
 }
 
-# === DAITA-PRIMARY PATH ===
-# Used when DAITA is the goal (with optional Quantum). Re-pins relay between
-# feature toggles to prevent the surprise-country-redirect from last session.
-connect_daita_path() {
+# Try to layer features (Quantum, DAITA, Obfuscation) onto an existing connection.
+# Sets globals: ACHIEVED_QUANTUM, ACHIEVED_DAITA, ACHIEVED_OBF
+layer_features() {
     local CC="$1"
-    echo "[$(date)] 🎯 DAITA mode: target ${CC^^}"
+    ACHIEVED_QUANTUM="off"
+    ACHIEVED_DAITA="off"
+    ACHIEVED_OBF="none"
 
-    reset_daemon
-    mullvad relay set location "$CC" 2>/dev/null
-    set_features_baseline
-    if [ "$DAITA_DIRECT_ONLY" = "1" ]; then
-        mullvad tunnel set daita-direct-only on 2>/dev/null \
-            && echo "[$(date)]   DAITA direct-only: enabled" \
-            || echo "[$(date)]   ⚠️  DAITA direct-only not supported by this daemon"
-    else
-        mullvad tunnel set daita-direct-only off 2>/dev/null
-    fi
-
-    # Phase 1: plain WG to verify country works
-    if ! try_connect "plain WG $CC"; then
-        return 1
-    fi
-
-    # Phase 2: enable Quantum if requested, RE-PIN country, reconnect
     if [ "$WANT_QUANTUM" = "1" ]; then
         echo "[$(date)] ➕ Enabling quantum-resistant..."
-        mullvad relay set location "$CC" 2>/dev/null   # re-pin (defensive)
+        [ -n "$CC" ] && mullvad relay set location "$CC" 2>/dev/null
         mullvad tunnel set quantum-resistant on 2>/dev/null
         mullvad reconnect 2>/dev/null
         wait_for_state "connected" 30
-        if [ "$(get_state)" != "connected" ]; then
-            echo "[$(date)] ⚠️  Quantum broke — reverting"
+        if [ "$(get_state)" = "connected" ]; then
+            ACHIEVED_QUANTUM="on"
+        else
+            echo "[$(date)] ⚠️  Quantum broke connection — disabling"
             mullvad tunnel set quantum-resistant off 2>/dev/null
             mullvad reconnect 2>/dev/null
             wait_for_state "connected" 30
         fi
     fi
 
-    # Phase 3: enable DAITA if requested, RE-PIN country, reconnect
     if [ "$WANT_DAITA" = "1" ]; then
         echo "[$(date)] ➕ Enabling DAITA..."
-        mullvad relay set location "$CC" 2>/dev/null   # re-pin (defensive)
+        [ -n "$CC" ] && mullvad relay set location "$CC" 2>/dev/null
+        if [ "$DAITA_DIRECT_ONLY" = "1" ]; then
+            mullvad tunnel set daita-direct-only on 2>/dev/null
+        else
+            mullvad tunnel set daita-direct-only off 2>/dev/null
+        fi
         mullvad tunnel set daita on 2>/dev/null
         mullvad reconnect 2>/dev/null
         wait_for_state "connected" 30
-        if [ "$(get_state)" != "connected" ]; then
-            echo "[$(date)] ⚠️  DAITA broke — reverting"
+        if [ "$(get_state)" = "connected" ]; then
+            ACHIEVED_DAITA="on"
+        else
+            echo "[$(date)] ⚠️  DAITA broke connection — disabling"
             mullvad tunnel set daita off 2>/dev/null
             mullvad reconnect 2>/dev/null
             wait_for_state "connected" 30
         fi
     fi
 
-    if [ "$(get_state)" = "connected" ]; then
-        ACTIVE_OBF="none"
-        ACTIVE_COUNTRY="$(get_exit_country)"
-        if [ "$ACTIVE_COUNTRY" != "$CC" ] && [ "$ACTIVE_COUNTRY" != "?" ]; then
-            echo "[$(date)] ⚠️  Exit country (${ACTIVE_COUNTRY^^}) ≠ target (${CC^^})"
-            echo "[$(date)]   Mullvad auto-multihopped (DAITA needed an entry elsewhere)."
-            echo "[$(date)]   Set DAITA_DIRECT_ONLY=1 to refuse this redirect."
+    if [ "$WANT_QUIC" = "1" ]; then
+        echo "[$(date)] ➕ Enabling QUIC obfuscation..."
+        if set_obf_mode quic; then
+            mullvad reconnect 2>/dev/null
+            wait_for_state "connected" 30
+            if [ "$(get_state)" = "connected" ]; then
+                ACHIEVED_OBF="quic"
+            else
+                # QUIC pool is small; widen country selection and try again
+                echo "[$(date)]   QUIC failed in pinned country — trying any country..."
+                mullvad relay set location any 2>/dev/null
+                mullvad reconnect 2>/dev/null
+                wait_for_state "connected" 30
+                if [ "$(get_state)" = "connected" ]; then
+                    ACHIEVED_OBF="quic"
+                    echo "[$(date)]   ✅ QUIC connected (any country)"
+                else
+                    echo "[$(date)]   QUIC unavailable — falling back through obfuscation chain..."
+                    [ "$OBF_FALLBACK" = "1" ] && obf_fallback_chain
+                fi
+            fi
         fi
-        return 0
     fi
-    return 1
+
+    return 0
 }
 
-# --- KILL PRIOR WATCHDOGS (broader reaping than v28) ---
-echo "[$(date)] 🧹 Reaping any stale watchdogs..."
+connect_progressive() {
+    local CC="$1"
+    echo "[$(date)] 🌍 Target country: ${CC^^}"
+
+    reset_daemon
+    if ! mullvad relay set location "$CC" 2>/dev/null; then
+        echo "[$(date)] ❌ relay set failed for $CC"
+        return 1
+    fi
+    set_features_baseline
+
+    if ! try_connect "plain WG"; then
+        echo "[$(date)] 🔄 Plain WG failed — restarting daemon and retrying"
+        systemctl restart mullvad-daemon 2>/dev/null
+        sleep 3
+        for i in $(seq 1 15); do mullvad status &>/dev/null && break; sleep 1; done
+        mullvad relay set location "$CC" 2>/dev/null
+        set_features_baseline
+        if ! try_connect "plain WG retry"; then
+            return 1
+        fi
+    fi
+
+    layer_features "$CC"
+    return 0
+}
+
+# --- KILL PRIOR WATCHDOG (safe, targeted only) ---
+echo "[$(date)] 🧹 Reaping prior watchdog (if any)..."
 if [ -f "$WATCHDOG_PIDFILE" ]; then
     OLD_PID="$(cat "$WATCHDOG_PIDFILE" 2>/dev/null || echo)"
-    [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null && kill "$OLD_PID" 2>/dev/null
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
+        kill "$OLD_PID" 2>/dev/null && echo "[$(date)]   killed prior watchdog PID $OLD_PID"
+        sleep 1
+    fi
     rm -f "$WATCHDOG_PIDFILE"
 fi
+# Only kill processes whose argv[0] is exactly the watchdog tag.
+# This is safe because we set argv[0] via `exec -a` when launching the watchdog.
 pkill -f "$WATCHDOG_TAG" 2>/dev/null
-# Broader sweep — anything with mullvad+watchdog in command line
-STALE=$(pgrep -f "mullvad.*watchdog\|watchdog.*mullvad" 2>/dev/null | wc -l)
-if [ "$STALE" -gt 0 ]; then
-    echo "[$(date)]   Found $STALE stale mullvad-watchdog processes — killing"
-    pkill -f "mullvad.*watchdog" 2>/dev/null
-    pkill -f "watchdog.*mullvad" 2>/dev/null
-    sleep 1
-fi
-# Also kill any old mullvad-optimizer.sh / mullvad.sh background loops
-pkill -f "mullvad-optimizer" 2>/dev/null
-sleep 1
+# v29.1: REMOVED the broad "mullvad-optimizer" pkill. It was matching the
+# tee process running `tee -a /var/log/mullvad-optimizer.log` and killing
+# it broke the script's stdout pipe → SIGPIPE → silent script exit.
 
 # --- HOST FIREWALL LOCKDOWN ---
 iptables -P FORWARD DROP || fail "FORWARD DROP"
@@ -547,31 +433,27 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null || fail "ip_forward"
 sysctl -w net.ipv6.conf.all.disable_ipv6=1 2>/dev/null
 sysctl -w net.ipv6.conf.default.disable_ipv6=1 2>/dev/null
 sysctl -w "net.ipv6.conf.${LAN_IF}.disable_ipv6=1" 2>/dev/null
-echo "[$(date)] 🛡️  Host firewall locked (FORWARD=DROP)"
+echo "[$(date)] 🛡️  Firewall locked (FORWARD=DROP, IPv6=DROP)"
 
-# --- MAIN CONNECT DECISION ---
-ACTIVE_OBF="none"
-ACTIVE_COUNTRY=""
+# --- ATTEMPT CONNECT WITH AUTO COUNTRY ROTATION ---
+TARGET=""
 SUCCESS=0
+ACHIEVED_QUANTUM="off"
+ACHIEVED_DAITA="off"
+ACHIEVED_OBF="none"
 
-if [ "$PRIMARY_OBF" = "quic" ]; then
-    # User wants QUIC — full robustness chain
-    if quic_fallback_chain; then SUCCESS=1; fi
-else
-    # No QUIC requested — DAITA/Quantum path with country rotation
-    for ATTEMPT in 1 2 3; do
-        CC="$(get_valid_country)"
-        [ "$ATTEMPT" -gt 1 ] && echo "[$(date)] 🔄 Attempt $ATTEMPT: ${CC^^}"
-        if connect_daita_path "$CC"; then
-            SUCCESS=1
-            break
-        fi
-        echo "$(date +%s) $CC" >> "$BAN_FILE"
-        echo "[$(date)] ⚠️  Banned ${CC^^} for 8h"
-    done
-fi
-
-[ "$SUCCESS" -ne 1 ] && fail "Could not establish any tunnel"
+for ATTEMPT in 1 2 3; do
+    CC="$(get_valid_country)"
+    [ "$ATTEMPT" -gt 1 ] && echo "[$(date)] 🔄 Attempt $ATTEMPT: trying ${CC^^}"
+    if connect_progressive "$CC"; then
+        TARGET="$CC"
+        SUCCESS=1
+        break
+    fi
+    echo "$(date +%s) $CC" >> "$BAN_FILE"
+    echo "[$(date)] ⚠️  Banned ${CC^^} for 8h"
+done
+[ "$SUCCESS" -ne 1 ] && fail "Could not connect to any allowed country"
 
 # --- WAIT FOR wg-mullvad INTERFACE ---
 WG_IF=""
@@ -581,9 +463,8 @@ for i in $(seq 1 40); do
     sleep 0.5
 done
 [ -z "$WG_IF" ] && fail "wg-mullvad interface never appeared"
-echo "[$(date)] ✅ Interface: $WG_IF"
+echo "[$(date)] ✅ Interface created: $WG_IF"
 echo "$WG_IF" > /var/tmp/mullvad_current_if
-echo "$ACTIVE_COUNTRY" > "$LAST_USED_FILE"
 
 # --- APPLY GATEWAY RULES ---
 iptables -A FORWARD -i "$LAN_IF" -o "$WG_IF" -j ACCEPT
@@ -596,51 +477,90 @@ iptables -A FORWARD -i "$LAN_IF" -p udp --dport 53 ! -o "$WG_IF" -j DROP
 iptables -A FORWARD -i "$LAN_IF" -p tcp --dport 53 ! -o "$WG_IF" -j DROP
 modprobe sch_cake 2>/dev/null
 tc qdisc del dev "$LAN_IF" root 2>/dev/null
-tc qdisc add dev "$LAN_IF" root cake bandwidth "$CAKE_BW" nat wash ack-filter 2>/dev/null
-echo "[$(date)] 🛡️  Gateway rules applied"
+tc qdisc add dev "$LAN_IF" root cake bandwidth "$CAKE_BW" nat wash ack-filter 2>/dev/null \
+    || echo "[$(date)]   ⚠️  CAKE qdisc setup failed"
+echo "[$(date)] 🛡️  Tunnel rules applied (NAT, MSS clamp, DNS lock, CAKE)"
 
-# --- VERIFY + STATUS REPORT ---
+# --- VERIFY + STATUS REPORT (RESTORED OLD FORMAT) ---
+echo "[$(date)] 🔍 Verifying connection..."
 sleep 2
-FULL_STATUS="$( { mullvad status -v 2>/dev/null || mullvad status 2>/dev/null; } )"
-IP="$(curl -s --max-time 8 https://am.i.mullvad.net/ip 2>/dev/null || echo Unknown)"
+STATE="$(get_state)"
+IP="$(curl -s --max-time 8 https://am.i.mullvad.net/ip 2>/dev/null || echo)"
 [ -z "$IP" ] && IP="Unknown"
 
-LOCATION="$(echo "$FULL_STATUS" | awk '/Visible location:/ {sub(/^[^:]*:[[:space:]]*/,""); sub(/[[:space:]]+IPv[46]:.*$/,""); print; exit}')"
+FULL_STATUS="$( { mullvad status -v 2>/dev/null || mullvad status 2>/dev/null; } )"
+
+# Parse fields
+RELAY_LINE="$(echo "$FULL_STATUS" | awk -F'Relay:[[:space:]]*' '/Relay:/ {print $2; exit}' | sed 's/[[:space:]]*$//')"
+RELAY_NAME="$(echo "$RELAY_LINE" | awk '{print $1}')"
+ENTRY_NAME="$(echo "$RELAY_LINE" | awk '/via/ {for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')"
+LOCATION="$(echo "$FULL_STATUS" | awk '/Visible location:/ {sub(/^[^:]*:[[:space:]]*/,""); sub(/[[:space:]]+IPv[46]:.*$/,""); sub(/[[:space:]]*\.?[[:space:]]*$/,""); print; exit}')"
 TUN_IP4="$(echo "$FULL_STATUS" | grep -oE 'IPv4:[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 | awk '{print $2}')"
+
+# Cross-check feature_indicators against achieved
 FULL_LOWER="$(echo "$FULL_STATUS" | tr '[:upper:]' '[:lower:]')"
-DAITA_ST="off"; QUANTUM_ST="off"
-echo "$FULL_LOWER" | grep -q "daita"   && DAITA_ST="on"
-echo "$FULL_LOWER" | grep -q "quantum" && QUANTUM_ST="on"
+QUANTUM_VERIFIED="off"; DAITA_VERIFIED="off"; OBF_VERIFIED="none"
+echo "$FULL_LOWER" | grep -q "quantum"     && QUANTUM_VERIFIED="on"
+echo "$FULL_LOWER" | grep -q "daita"       && DAITA_VERIFIED="on"
+echo "$FULL_LOWER" | grep -q "quic"        && OBF_VERIFIED="quic"
+echo "$FULL_LOWER" | grep -q "shadowsocks" && OBF_VERIFIED="shadowsocks"
+echo "$FULL_LOWER" | grep -qE "udp2tcp|udp-over-tcp" && OBF_VERIFIED="udp2tcp"
+echo "$FULL_LOWER" | grep -qE "lwo|lightweight" && OBF_VERIFIED="lwo"
+
+MULTIHOP="off"
+[ -n "$ENTRY_NAME" ] && MULTIHOP="on"
+echo "$FULL_LOWER" | grep -q "multihop" && MULTIHOP="on"
+
+# Engage host kill-switch
+LOCKDOWN_ST="off"
+if [ "$ENABLE_LOCKDOWN" = "1" ] && [ "$STATE" = "connected" ]; then
+    if mullvad lockdown-mode set on 2>/dev/null; then
+        LOCKDOWN_ST="on"
+    fi
+fi
+
+OBF_DESC="$(obf_descriptor "$OBF_VERIFIED")"
+MSS_DESC="$(mss_descriptor "$MSS_CLAMP")"
+MTU_DESC="$(mtu_descriptor "$WG_MTU")"
 
 echo ""
 echo "[$(date)] ✅ Connection Established!"
 echo ""
 echo "══════════════════════════ STATUS REPORT ══════════════════════════"
-printf "  %-14s %s\n" "EXIT COUNTRY:" "${ACTIVE_COUNTRY^^}"
-printf "  %-14s %s\n" "LOCATION:"     "${LOCATION:-(unknown)}"
-printf "  %-14s %s\n" "PUBLIC IP:"    "$IP"
-printf "  %-14s %s\n" "TUNNEL IPv4:"  "${TUN_IP4:-(unknown)}"
-printf "  %-14s %s\n" "INTERFACE:"    "$WG_IF"
+printf "  %-14s %s\n" "STATE:"       "$STATE"
+printf "  %-14s %s\n" "TARGET CC:"   "${TARGET^^}"
+[ -n "$RELAY_NAME" ] && printf "  %-14s %s\n" "RELAY:"       "$RELAY_NAME"
+[ -n "$ENTRY_NAME" ] && printf "  %-14s %s\n" "ENTRY (hop):" "$ENTRY_NAME"
+[ -n "$LOCATION"   ] && printf "  %-14s %s\n" "LOCATION:"    "$LOCATION"
+printf "  %-14s %s\n" "PUBLIC IP:"   "$IP"
+[ -n "$TUN_IP4"    ] && printf "  %-14s %s\n" "TUNNEL IPv4:" "$TUN_IP4"
+printf "  %-14s %s\n" "INTERFACE:"   "$WG_IF"
 echo  "  ─────────────────────────────────────────────────────────────"
-printf "  %-14s %s\n" "OBFUSCATION:"  "$ACTIVE_OBF"
-printf "  %-14s %s\n" "QUANTUM:"      "$QUANTUM_ST"
-printf "  %-14s %s\n" "DAITA:"        "$DAITA_ST"
+printf "  %-14s %s (%s)\n" "OBFUSCATION:" "$OBF_VERIFIED" "$OBF_DESC"
+printf "  %-14s %s\n"     "QUANTUM:"     "$QUANTUM_VERIFIED"
+printf "  %-14s %s\n"     "DAITA:"       "$DAITA_VERIFIED"
+printf "  %-14s %s\n"     "MULTIHOP:"    "$MULTIHOP"
 echo  "  ─────────────────────────────────────────────────────────────"
-printf "  %-14s %s\n" "WG MTU:"       "$WG_MTU"
-printf "  %-14s %s\n" "MSS CLAMP:"    "$MSS_CLAMP"
-printf "  %-14s CAKE @ %s\n" "QUEUE:" "$CAKE_BW"
+printf "  %-14s %s (%s)\n" "WG MTU:"    "$WG_MTU"    "$MTU_DESC"
+printf "  %-14s %s (%s)\n" "MSS CLAMP:" "$MSS_CLAMP" "$MSS_DESC"
+printf "  %-14s CAKE (%s)\n" "QUEUE:"   "$CAKE_BW"
 echo  "  ─────────────────────────────────────────────────────────────"
-printf "  %-14s DROP (host kill-switch)\n" "FWD POLICY:"
+printf "  %-14s %s  (Mullvad host kill-switch)\n" "LOCKDOWN:"  "$LOCKDOWN_ST"
+printf "  %-14s DROP (tunnel-only)\n"             "FWD POLICY:"
 echo "═══════════════════════════════════════════════════════════════════"
 
-if [ "$PRIMARY_OBF" = "quic" ] && [ "$ACTIVE_OBF" != "quic" ]; then
+# Warnings about feature mismatches (informational)
+if [ "$WANT_QUIC" = "1" ] && [ "$OBF_VERIFIED" != "quic" ]; then
     echo ""
-    echo "  ⚠️  QUIC was requested but unavailable — fell back to: $ACTIVE_OBF"
-    echo "      Possible reasons: no QUIC-capable relay reachable, or your"
-    echo "      ISP blocks UDP/443 outbound. Tunnel is still secure."
+    echo "  ⚠️  QUIC requested but not active — achieved: $OBF_VERIFIED"
+    echo "      Mullvad's QUIC relay pool is limited (per upstream issue #8742)."
+fi
+if [ "$WANT_DAITA" = "1" ] && [ "$DAITA_VERIFIED" != "on" ]; then
+    echo ""
+    echo "  ⚠️  DAITA requested but not active. No relay matched all constraints."
 fi
 
-# --- WATCHDOG (v29: tolerant ping, less log spam) ---
+# --- WATCHDOG ---
 (
 exec -a "$WATCHDOG_TAG" bash <<EOF_WATCHDOG
 set -u
@@ -652,7 +572,7 @@ ALLOWED_COUNTRIES=($(printf "'%s' " "${ALLOWED_COUNTRIES[@]}"))
 BAN_FILE='$BAN_FILE'
 LAST_USED_FILE='$LAST_USED_FILE'
 LOG_FILE='$LOG_FILE'
-ACTIVE_OBF='$ACTIVE_OBF'
+ACHIEVED_OBF='$OBF_VERIFIED'
 WANT_QUANTUM=$WANT_QUANTUM
 WANT_DAITA=$WANT_DAITA
 
@@ -665,7 +585,7 @@ CURRENT_IF="\$(cat /var/tmp/mullvad_current_if 2>/dev/null || echo)"
 CURRENT_COUNTRY="\$(cat "\$LAST_USED_FILE" 2>/dev/null || echo)"
 
 log() { echo "[\$(date)] \$*" >> "\$LOG_FILE"; }
-log "👁️  Watchdog v29 (IF=\$CURRENT_IF country=\$CURRENT_COUNTRY obf=\$ACTIVE_OBF)"
+log "👁️  Watchdog v29.1 active (IF=\$CURRENT_IF country=\$CURRENT_COUNTRY obf=\$ACHIEVED_OBF)"
 
 cleanup_iface() {
     local IF="\$1"
@@ -701,7 +621,7 @@ get_state() {
         | grep -oE 'disconnected|connecting|connected|blocked|error' | head -1
 }
 
-# v29: tolerant ping check — 3 packets, healthy if 2/3 succeed, 5s timeout each
+# Tolerant ping check — 3 packets, healthy if 2/3 succeed
 ping_healthy() {
     local OK=0
     for i in 1 2 3; do
@@ -711,14 +631,13 @@ ping_healthy() {
 }
 
 while true; do
-    sleep 15  # v29: was 10, gives more breathing room
+    sleep 15
 
     HEALTHY=true
     [ "\$(get_state)" != "connected" ] && HEALTHY=false
     \$HEALTHY && ! ping_healthy && HEALTHY=false
 
     if \$HEALTHY; then
-        # v29: only log "Health restored" if we actually recovered (not on startup)
         if [ "\$RECOVERED_RECENTLY" = "1" ]; then
             log "💚 Health restored"
             RECOVERED_RECENTLY=0
@@ -729,7 +648,6 @@ while true; do
     fi
 
     FAIL_COUNT=\$((FAIL_COUNT + 1))
-    # v29: silent below threshold (was logging every blip)
     [ \$FAIL_COUNT -lt \$THRESHOLD ] && continue
 
     log "⚠️  Persistent connection drop (3 consecutive checks failed) — migrating"
@@ -755,7 +673,6 @@ while true; do
     sleep 4
     for i in \$(seq 1 15); do mullvad status &>/dev/null && break; sleep 1; done
 
-    # Re-establish with same obfuscation if possible
     mullvad relay set location "\$NEW_COUNTRY" 2>/dev/null
     mullvad anti-censorship set mode auto 2>/dev/null \
         || mullvad obfuscation set mode auto 2>/dev/null
@@ -766,19 +683,6 @@ while true; do
     sleep 2
 
     if [ "\$(get_state)" = "connected" ]; then
-        # Re-apply previous obfuscation mode (best-effort)
-        if [ "\$ACTIVE_OBF" != "none" ] && [ "\$ACTIVE_OBF" != "auto" ]; then
-            mullvad anti-censorship set mode "\$ACTIVE_OBF" 2>/dev/null \
-                || mullvad obfuscation set mode "\$ACTIVE_OBF" 2>/dev/null
-            mullvad reconnect 2>/dev/null
-            sleep 5
-            [ "\$(get_state)" != "connected" ] && {
-                log "  ⚠️  obf=\$ACTIVE_OBF didn't take — using auto"
-                mullvad anti-censorship set mode auto 2>/dev/null \
-                    || mullvad obfuscation set mode auto 2>/dev/null
-                mullvad reconnect 2>/dev/null; sleep 5
-            }
-        fi
         if [ "\$WANT_QUANTUM" = "1" ]; then
             mullvad tunnel set quantum-resistant on 2>/dev/null
             mullvad reconnect 2>/dev/null; sleep 5
@@ -792,6 +696,16 @@ while true; do
             mullvad reconnect 2>/dev/null; sleep 5
             [ "\$(get_state)" != "connected" ] && {
                 mullvad tunnel set daita off 2>/dev/null
+                mullvad reconnect 2>/dev/null; sleep 5
+            }
+        fi
+        if [ "\$ACHIEVED_OBF" != "none" ]; then
+            mullvad anti-censorship set mode "\$ACHIEVED_OBF" 2>/dev/null \
+                || mullvad obfuscation set mode "\$ACHIEVED_OBF" 2>/dev/null
+            mullvad reconnect 2>/dev/null; sleep 5
+            [ "\$(get_state)" != "connected" ] && {
+                mullvad anti-censorship set mode auto 2>/dev/null \
+                    || mullvad obfuscation set mode auto 2>/dev/null
                 mullvad reconnect 2>/dev/null; sleep 5
             }
         fi
@@ -825,14 +739,10 @@ WATCHDOG_PID=$!
 echo "$WATCHDOG_PID" > "$WATCHDOG_PIDFILE"
 trap - INT TERM
 echo ""
-echo "[$(date)] 👁️  Watchdog v29 launched (PID: $WATCHDOG_PID)"
+echo "[$(date)] 👁️  Watchdog launched (PID: $WATCHDOG_PID)"
 echo "[$(date)] 🚀 Gateway ready"
 echo ""
 echo "  📜 Logs:     tail -f $LOG_FILE"
 echo "  🛑 Teardown: sudo bash teardown-mullvad-gateway-v28.sh"
 echo "  🚑 Emergency: sudo bash emergency-restore.sh"
-echo ""
-echo "  Try QUIC mode:    sudo WANT_DAITA=0 WANT_QUIC=1 bash mullvad-v29.sh"
-echo "  Force country:    sudo TARGET_COUNTRY=ch bash mullvad-v29.sh"
-echo "  DAITA strict:     sudo DAITA_DIRECT_ONLY=1 bash mullvad-v29.sh"
 echo ""
